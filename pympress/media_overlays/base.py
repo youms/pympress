@@ -213,18 +213,113 @@ class VideoOverlay(builder.Builder):
                            'LTRB = {}'.format(self.rect))
 
 
+    #: Current zoom scale applied to the slide (>= 1.0)
+    zoom_scale = 1.0
+    #: Current zoom shift applied to the slide (x, y in normalized slide space)
+    zoom_shift = (0.0, 0.0)
+    #: Normalized crop fractions (left, right, top, bottom) relative to the media stream (0..1)
+    crop_fractions = (0.0, 0.0, 0.0, 0.0)
+    #: `bool` whether pointer events go through this overlay to the slide below it
+    pass_through = False
+
+    def set_pass_through(self, pass_through):
+        """ Let pointer events go through the overlay to the slide below, or catch them again.
+
+        This lets the user draw the zoom selection over a video.
+
+        Args:
+            pass_through (`bool`): whether pointer events go through the overlay
+        """
+        self.pass_through = pass_through
+        if self.is_shown():
+            self.parent.set_overlay_pass_through(self.media_overlay, pass_through)
+        self.apply_window_pass_through()
+
+
+    def apply_window_pass_through(self):
+        """ Apply :attr:`pass_through` to the window of the widget that draws the video, which catches events itself.
+        """
+        widget = getattr(self, 'video_widget', None) or self.movie_zone
+        window = widget.get_window() if widget is not None else None
+        if window is not None:
+            window.set_pass_through(self.pass_through)
+
+
+    def set_zoom(self, scale, shift):
+        """ Apply zoom transformation to this overlay.
+
+        Args:
+            scale (float): Cairo zoom factor (>= 1.0)
+            shift (tuple of float): (shift_x, shift_y) in normalized slide coordinates
+        """
+        self.zoom_scale = scale
+        self.zoom_shift = shift
+        self.resize()
+
+
+    def apply_crop(self):
+        """ Backend hook to apply crop_fractions to video sink/pipeline. Subclasses override.
+        """
+        pass
+
+
     def resize(self):
-        """ Adjust the position and size of the media overlay.
+        """ Adjust the position, size, and crop margins of the media overlay under current zoom.
         """
         if not self.is_shown():
+            logger.debug('VideoOverlay.resize: not shown (parent=%s)', self.media_overlay.get_parent())
             return
 
         pw, ph = self.parent.get_allocated_width(), self.parent.get_allocated_height()
+        if pw <= 1 or ph <= 1:
+            logger.debug('VideoOverlay.resize: allocation <= 1 (%dx%d)', pw, ph)
+            return
+
         left, top, right, bot = self.rect
-        self.media_overlay.props.margin_left   = pw * max(left, 0)
-        self.media_overlay.props.margin_right  = pw * min(1 - right, 1)
-        self.media_overlay.props.margin_bottom = ph * min(1 - bot, 1)
-        self.media_overlay.props.margin_top    = ph * max(top, 0)
+        scale = self.zoom_scale
+        shift_x, shift_y = self.zoom_shift
+
+        # Zoomed coordinates in slide screen space
+        scr_left = scale * left + shift_x
+        scr_right = scale * right + shift_x
+        scr_top = scale * top + shift_y
+        scr_bot = scale * bot + shift_y
+
+        # Clamp to visible viewport [0, 1] x [0, 1]
+        vis_left = max(0.0, scr_left)
+        vis_right = min(1.0, scr_right)
+        vis_top = max(0.0, scr_top)
+        vis_bot = min(1.0, scr_bot)
+
+        # If completely outside visible slide area
+        if vis_left >= vis_right or vis_top >= vis_bot:
+            self.media_overlay.set_visible(False)
+            self.crop_fractions = (0.0, 0.0, 0.0, 0.0)
+            self.apply_crop()
+            return
+
+        self.media_overlay.set_visible(True)
+
+        # Margins on the GTK overlay container (always >= 0)
+        self.media_overlay.props.margin_left = int(round(pw * vis_left))
+        self.media_overlay.props.margin_right = int(round(pw * (1.0 - vis_right)))
+        self.media_overlay.props.margin_top = int(round(ph * vis_top))
+        self.media_overlay.props.margin_bottom = int(round(ph * (1.0 - vis_bot)))
+
+        # Normalized crop fractions inside the media stream
+        media_w = scr_right - scr_left
+        media_h = scr_bot - scr_top
+        crop_left = max(0.0, (vis_left - scr_left) / media_w) if media_w > 0 else 0.0
+        crop_right = max(0.0, (scr_right - vis_right) / media_w) if media_w > 0 else 0.0
+        crop_top = max(0.0, (vis_top - scr_top) / media_h) if media_h > 0 else 0.0
+        crop_bottom = max(0.0, (scr_bot - vis_bot) / media_h) if media_h > 0 else 0.0
+
+        self.crop_fractions = (crop_left, crop_right, crop_top, crop_bottom)
+        logger.debug('VideoOverlay.resize: margins=(%d, %d, %d, %d), crop=(%.3f, %.3f, %.3f, %.3f)',
+                     self.media_overlay.props.margin_left, self.media_overlay.props.margin_right,
+                     self.media_overlay.props.margin_top, self.media_overlay.props.margin_bottom,
+                     *self.crop_fractions)
+        self.apply_crop()
 
 
     def is_shown(self):
@@ -270,9 +365,11 @@ class VideoOverlay(builder.Builder):
         if not self.media_overlay.get_parent():
             self.parent.add_overlay(self.media_overlay)
             self.parent.reorder_overlay(self.media_overlay, 2)
+            self.parent.set_overlay_pass_through(self.media_overlay, self.pass_through)
             self.resize()
             self.parent.queue_draw()
         self.media_overlay.show()
+        self.apply_window_pass_through()
 
 
     def do_hide(self, *args):
