@@ -170,6 +170,7 @@ class GstOverlay(base.VideoOverlay):
             self.video_widget = self.sink.props.widget
         self.playbin.set_property('video-sink', self.sink)
         self.setup_gpu_conversion()
+        self.setup_crop_filter()
 
         super(GstOverlay, self).__init__(*args, **kwargs)
 
@@ -230,6 +231,96 @@ class GstOverlay(base.VideoOverlay):
             self.sink.props.widget.connect('size-allocate', self.on_video_widget_allocated)
         # The size is set when the caps reach d3d11convert, before it negotiates. While playing it only grows (see
         # on_video_widget_allocated): gtksink can get stuck on the old size when the size shrinks mid-stream.
+
+
+    #: `Gst.Element` the `videocrop` element that zooms into the video, or `None` if it is not available
+    crop_filter = None
+    #: `tuple` of `int` width and height of the frames that reach :attr:`crop_filter`, once known
+    crop_input_size = None
+
+    def setup_crop_filter(self):
+        """ Add a `videocrop` element to the video filter, to follow the zoom on the slide.
+
+        `videocrop` works on frames in system memory. Without a GPU conversion bin it is the playbin's video filter,
+        with one it goes after `d3d11download` in that bin, so that the crop is the same code on every platform.
+        """
+        if Gst.ElementFactory.find('videocrop') is None:
+            return
+
+        crop = Gst.ElementFactory.make('videocrop', 'zoomcrop')
+        video_filter = self.playbin.get_property('video-filter')
+        if video_filter is None:
+            self.playbin.set_property('video-filter', crop)
+        elif isinstance(video_filter, Gst.Bin):
+            ghost = video_filter.get_static_pad('src')
+            last = ghost.get_target().get_parent_element()
+            video_filter.add(crop)
+            ghost.set_target(None)
+            if not last.link(crop) or not ghost.set_target(crop.get_static_pad('src')):
+                logger.warning('Zoom crop not set up: cannot add videocrop to the GPU conversion')
+                return
+        else:
+            return
+
+        self.crop_filter = crop
+        crop.get_static_pad('sink').add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.on_crop_sink_event)
+
+
+    def on_crop_sink_event(self, pad, info):
+        """ Note the size of the frames that reach `videocrop`, and apply the pending crop for it.
+
+        The crop is in pixels of the incoming frame, so a new size needs a new crop. Runs on the streaming thread, so
+        GTK and pipeline calls are left to the main thread.
+        """
+        event = info.get_event()
+        if event.type == Gst.EventType.CAPS:
+            s = event.parse_caps().get_structure(0)
+            ok_w, w = s.get_int('width')
+            ok_h, h = s.get_int('height')
+            if ok_w and ok_h:
+                self.crop_input_size = (w, h)
+                if any(self.crop_fractions):
+                    GLib.idle_add(self.apply_crop)
+        return Gst.PadProbeReturn.OK
+
+
+    def apply_crop(self):
+        """ Apply :attr:`crop_fractions` to `videocrop` and repaint a paused or frozen frame (main thread).
+        """
+        if self.crop_filter is None or self.crop_input_size is None:
+            return False  # without a size the caps event will call us again
+
+        # the crop is in pixels of the frame that videocrop receives, which may be scaled already
+        w, h = self.crop_input_size
+        left, right, top, bottom = (round(f * size) for f, size in zip(self.crop_fractions, (w, w, h, h)))
+        # never crop the whole frame
+        right = max(0, min(right, w - left - 2))
+        bottom = max(0, min(bottom, h - top - 2))
+        for name, value in (('left', left), ('right', right), ('top', top), ('bottom', bottom)):
+            self.crop_filter.set_property(name, value)
+        logger.debug('GStreamer: zoom crop left=%d right=%d top=%d bottom=%d on %dx%d', left, right, top, bottom, w, h)
+
+        self.repaint_still_frame()
+        return False
+
+
+    def repaint_still_frame(self):
+        """ Seek to the current position to draw the frame again, if the video is paused or frozen at its end.
+        """
+        ret, state, pending = self.playbin.get_state(0)
+        is_actively_playing = (state == Gst.State.PLAYING and pending != Gst.State.PAUSED and not self.is_frozen)
+        if is_actively_playing:
+            return
+
+        if self.is_frozen:
+            self.playbin.set_state(Gst.State.PAUSED)
+        ok_pos, pos = self.playbin.query_position(Gst.Format.TIME)
+        ok_dur, dur = self.playbin.query_duration(Gst.Format.TIME)
+        seek_pos = pos if ok_pos and pos > 0 else int(self.last_timestamp * Gst.SECOND)
+        if ok_dur and dur > 0:
+            # a position at the very end has no frame left to decode: stay inside the last frame
+            seek_pos = min(seek_pos, max(0, dur - 5 * Gst.MSECOND))
+        self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE, seek_pos)
 
 
     def update_gpu_target(self):
@@ -352,19 +443,7 @@ class GstOverlay(base.VideoOverlay):
         )
         self.gpu_size_filter.set_property('caps', new_caps)
 
-        # Repaint if paused or frozen at EOS
-        ret, state, pending = self.playbin.get_state(0)
-        is_actively_playing = (state == Gst.State.PLAYING and pending != Gst.State.PAUSED and not self.is_frozen)
-        if not is_actively_playing:
-            if self.is_frozen:
-                self.playbin.set_state(Gst.State.PAUSED)
-            ok_pos, pos = self.playbin.query_position(Gst.Format.TIME)
-            ok_dur, dur = self.playbin.query_duration(Gst.Format.TIME)
-            seek_pos = pos if ok_pos and pos > 0 else int(self.last_timestamp * Gst.SECOND)
-            if ok_dur and dur > 0:
-                # a position at the very end has no frame left to decode: stay inside the last frame
-                seek_pos = min(seek_pos, max(0, dur - 5 * Gst.MSECOND))
-            self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE, seek_pos)
+        self.repaint_still_frame()
 
         return False
 
