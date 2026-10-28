@@ -235,42 +235,64 @@ class GstOverlay(base.VideoOverlay):
 
     #: `Gst.Element` the `videocrop` element that zooms into the video, or `None` if it is not available
     crop_filter = None
+    #: `Gst.Element` the `capsfilter` after `videocrop` that keeps the frames at the size they had before the crop
+    crop_size_filter = None
     #: `tuple` of `int` width and height of the frames that reach :attr:`crop_filter`, once known
     crop_input_size = None
 
     def setup_crop_filter(self):
-        """ Add a `videocrop` element to the video filter, to follow the zoom on the slide.
+        """ Add `videocrop` and a `videoscale` back to the original size to the video filter, to follow the zoom.
 
-        `videocrop` works on frames in system memory. Without a GPU conversion bin it is the playbin's video filter,
-        with one it goes after `d3d11download` in that bin, so that the crop is the same code on every platform.
+        `videocrop` works on frames in system memory. Without a GPU conversion bin the crop is the playbin's video
+        filter, with one it goes after `d3d11download` in that bin, so that the crop is the same code on every platform.
+
+        The crop makes the frames smaller, and gtksink can get stuck on the old size when the size shrinks mid-stream
+        (see :meth:`on_video_widget_allocated`): it then draws nothing, with one critical message per frame. So the
+        frames are scaled back to the size they had, and the sink always gets the same size.
         """
-        if Gst.ElementFactory.find('videocrop') is None:
+        if any(Gst.ElementFactory.find(name) is None for name in ('videocrop', 'videoscale', 'capsfilter')):
             return
 
         crop = Gst.ElementFactory.make('videocrop', 'zoomcrop')
+        scale = Gst.ElementFactory.make('videoscale', 'zoomscale')
+        size = Gst.ElementFactory.make('capsfilter', 'zoomsize')
         video_filter = self.playbin.get_property('video-filter')
+
         if video_filter is None:
-            self.playbin.set_property('video-filter', crop)
+            video_filter = Gst.Bin.new('zoomfilter')
+            for element in (crop, scale, size):
+                video_filter.add(element)
+            if not crop.link(scale) or not scale.link(size):
+                logger.warning('Zoom crop not set up: cannot link videocrop and videoscale')
+                return
+            video_filter.add_pad(Gst.GhostPad.new('sink', crop.get_static_pad('sink')))
+            video_filter.add_pad(Gst.GhostPad.new('src', size.get_static_pad('src')))
+            self.playbin.set_property('video-filter', video_filter)
         elif isinstance(video_filter, Gst.Bin):
             ghost = video_filter.get_static_pad('src')
             last = ghost.get_target().get_parent_element()
-            video_filter.add(crop)
+            for element in (crop, scale, size):
+                video_filter.add(element)
             ghost.set_target(None)
-            if not last.link(crop) or not ghost.set_target(crop.get_static_pad('src')):
+            linked = (last.link(crop) and crop.link(scale) and scale.link(size) and
+                      ghost.set_target(size.get_static_pad('src')))
+            if not linked:
                 logger.warning('Zoom crop not set up: cannot add videocrop to the GPU conversion')
                 return
         else:
             return
 
         self.crop_filter = crop
+        self.crop_size_filter = size
         crop.get_static_pad('sink').add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.on_crop_sink_event)
 
 
     def on_crop_sink_event(self, pad, info):
-        """ Note the size of the frames that reach `videocrop`, and apply the pending crop for it.
+        """ Follow the size of the frames that reach `videocrop`: the crop in pixels and the output size.
 
-        The crop is in pixels of the incoming frame, so a new size needs a new crop. Runs on the streaming thread, so
-        GTK and pipeline calls are left to the main thread.
+        The crop is in pixels of the incoming frame, and `videocrop` stops the stream when it leaves nothing of a
+        frame, so both are set here, before the first frame of the new size gets through. Runs on the streaming
+        thread, so GTK calls are left to the main thread.
         """
         event = info.get_event()
         if event.type == Gst.EventType.CAPS:
@@ -279,25 +301,44 @@ class GstOverlay(base.VideoOverlay):
             ok_h, h = s.get_int('height')
             if ok_w and ok_h:
                 self.crop_input_size = (w, h)
+                caps = 'video/x-raw,width={},height={}'.format(w, h)
+                ok_par, par_n, par_d = s.get_fraction('pixel-aspect-ratio')
+                if ok_par:
+                    caps += ',pixel-aspect-ratio={}/{}'.format(par_n, par_d)
+                self.crop_size_filter.set_property('caps', Gst.Caps.from_string(caps))
+                self.set_crop(w, h)
                 if any(self.crop_fractions):
-                    GLib.idle_add(self.apply_crop)
+                    GLib.idle_add(self.repaint_still_frame)
         return Gst.PadProbeReturn.OK
+
+
+    def set_crop(self, w, h):
+        """ Set the crop of `videocrop` from :attr:`crop_fractions`, for frames of `w` by `h` pixels.
+
+        Frames may be flowing, so every step must leave a frame: the values that grow are first set to the smaller of
+        the old and new value, then to the new one. Each step is then no bigger than the old or the new crop.
+        """
+        new = [round(f * size) for f, size in zip(self.crop_fractions, (w, w, h, h))]
+        # never crop the whole frame
+        new[1] = max(0, min(new[1], w - new[0] - 2))
+        new[3] = max(0, min(new[3], h - new[2] - 2))
+        names = ('left', 'right', 'top', 'bottom')
+        old = [self.crop_filter.get_property(name) for name in names]
+        for values in ([min(o, n) for o, n in zip(old, new)], new):
+            for name, value in zip(names, values):
+                self.crop_filter.set_property(name, value)
+        return new
 
 
     def apply_crop(self):
         """ Apply :attr:`crop_fractions` to `videocrop` and repaint a paused or frozen frame (main thread).
         """
         if self.crop_filter is None or self.crop_input_size is None:
-            return False  # without a size the caps event will call us again
+            return False  # without a size the caps event will set the crop
 
         # the crop is in pixels of the frame that videocrop receives, which may be scaled already
         w, h = self.crop_input_size
-        left, right, top, bottom = (round(f * size) for f, size in zip(self.crop_fractions, (w, w, h, h)))
-        # never crop the whole frame
-        right = max(0, min(right, w - left - 2))
-        bottom = max(0, min(bottom, h - top - 2))
-        for name, value in (('left', left), ('right', right), ('top', top), ('bottom', bottom)):
-            self.crop_filter.set_property(name, value)
+        left, right, top, bottom = self.set_crop(w, h)
         logger.debug('GStreamer: zoom crop left=%d right=%d top=%d bottom=%d on %dx%d', left, right, top, bottom, w, h)
 
         self.repaint_still_frame()
