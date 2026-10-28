@@ -59,6 +59,14 @@ class GstOverlay(base.VideoOverlay):
     gpu_size = None
     #: `int` id of the tick callback that keeps the frame clock running during playback, if any
     frame_tick_id = None
+    #: native clip dimensions and display aspect ratio from the decoder
+    clip_w = None
+    clip_h = None
+    clip_dar = None
+    #: pending timer id for debounced dynamic preview scaling
+    preview_resize_timer_id = None
+    #: whether playback has reached its end and is holding the last frame
+    is_frozen = False
 
     def __init__(self, *args, **kwargs):
         # Create GStreamer playbin
@@ -111,10 +119,12 @@ class GstOverlay(base.VideoOverlay):
         self.playbin.set_property('video-filter', video_filter)
         self.playbin.set_property('flags', flags)
         self.gpu_size_filter = video_filter.get_by_name('gpusize')
-        # The size is set when the caps reach d3d11convert, before it negotiates, and never while playing: gtksink can
-        # get stuck on the old size when the size shrinks mid-stream (it reads it back from a frame it still holds).
         video_filter.get_by_name('gpuconvert').get_static_pad('sink').add_probe(
             Gst.PadProbeType.EVENT_DOWNSTREAM, self.on_gpu_convert_event)
+        if self.sink.find_property('widget') is not None:    # not every sink has a widget to follow
+            self.sink.props.widget.connect('size-allocate', self.on_video_widget_allocated)
+        # The size is set when the caps reach d3d11convert, before it negotiates. While playing it only grows (see
+        # on_video_widget_allocated): gtksink can get stuck on the old size when the size shrinks mid-stream.
 
 
     def update_gpu_target(self):
@@ -130,7 +140,7 @@ class GstOverlay(base.VideoOverlay):
         if self.toolbar.get_visible():
             h -= self.toolbar.get_preferred_height()[1]
         scale = self.parent.get_scale_factor()
-        self.gpu_target = (w * scale, h * scale) if w >= 16 and h >= 16 else None
+        self.gpu_target = (int(w * scale), int(h * scale)) if w >= 16 and h >= 16 else None
 
 
     def on_gpu_convert_event(self, pad, info):
@@ -152,8 +162,12 @@ class GstOverlay(base.VideoOverlay):
         if not ok_w or not ok_h or w <= 0 or h <= 0:
             return Gst.PadProbeReturn.OK
 
-        aw, ah = target
+        self.clip_w = w
+        self.clip_h = h
         dar = w * par_n / (h * par_d)
+        self.clip_dar = dar
+
+        aw, ah = target
         if aw / ah <= dar:
             size = (aw, min(ah, max(2, round(aw / dar))))
         else:
@@ -165,6 +179,79 @@ class GstOverlay(base.VideoOverlay):
                 'video/x-raw(memory:D3D11Memory),format=BGRx,width={},height={},pixel-aspect-ratio=1/1'.format(*size)
             ))
         return Gst.PadProbeReturn.OK
+
+
+    def on_video_widget_allocated(self, widget, allocation):
+        """ Handle widget allocation changes for dynamic preview sizing (main thread).
+
+        Caps dimensions only ever increase to avoid gtksink shrink issues (gitlab issue #1082).
+        """
+        if self.gpu_size_filter is None or self.clip_dar is None:
+            return
+
+        scale = widget.get_scale_factor()
+        aw = int(allocation.width * scale)
+        ah = int(allocation.height * scale)
+        dar = self.clip_dar
+        if aw <= 16 or ah <= 16:
+            return
+
+        if aw / ah <= dar:
+            target_w = aw
+            target_h = min(ah, max(2, round(aw / dar)))
+        else:
+            target_w = min(aw, max(2, round(ah * dar)))
+            target_h = ah
+
+        # Cap at native clip size
+        if target_w > self.clip_w or target_h > self.clip_h:
+            target_w = self.clip_w if self.clip_w / dar <= self.clip_h else max(2, round(self.clip_h * dar))
+            target_h = min(self.clip_h, max(2, round(target_w / dar)))
+
+        target_w, target_h = int(target_w), int(target_h)
+        current_w, current_h = self.gpu_size if self.gpu_size else (0, 0)
+
+        # Growth only: update if either dimension exceeds the current frame by > 5%
+        if target_w > current_w * 1.05 or target_h > current_h * 1.05:
+            if self.preview_resize_timer_id is not None:
+                GLib.source_remove(self.preview_resize_timer_id)
+            self.preview_resize_timer_id = GLib.timeout_add(250, self.apply_dynamic_preview_size, target_w, target_h)
+
+
+    def apply_dynamic_preview_size(self, target_w, target_h):
+        """ Update the GPU scaling caps on the fly when the widget grows (main thread).
+        """
+        self.preview_resize_timer_id = None
+        if self.gpu_size_filter is None or not self.is_shown():
+            return False
+
+        current_w, current_h = self.gpu_size if self.gpu_size else (0, 0)
+        if target_w <= current_w and target_h <= current_h:
+            return False
+
+        target_w, target_h = int(target_w), int(target_h)
+        self.gpu_size = (target_w, target_h)
+        new_caps = Gst.Caps.from_string(
+            'video/x-raw(memory:D3D11Memory),format=BGRx,width={},height={},pixel-aspect-ratio=1/1'.format(
+                target_w, target_h)
+        )
+        self.gpu_size_filter.set_property('caps', new_caps)
+
+        # Repaint if paused or frozen at EOS
+        ret, state, pending = self.playbin.get_state(0)
+        is_actively_playing = (state == Gst.State.PLAYING and pending != Gst.State.PAUSED and not self.is_frozen)
+        if not is_actively_playing:
+            if self.is_frozen:
+                self.playbin.set_state(Gst.State.PAUSED)
+            ok_pos, pos = self.playbin.query_position(Gst.Format.TIME)
+            ok_dur, dur = self.playbin.query_duration(Gst.Format.TIME)
+            seek_pos = pos if ok_pos and pos > 0 else int(self.last_timestamp * Gst.SECOND)
+            if ok_dur and dur > 0:
+                # a position at the very end has no frame left to decode: stay inside the last frame
+                seek_pos = min(seek_pos, max(0, dur - 5 * Gst.MSECOND))
+            self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE, seek_pos)
+
+        return False
 
 
     def start_frame_tick(self):
@@ -288,12 +375,21 @@ class GstOverlay(base.VideoOverlay):
         return self.playbin.get_state(0).state in {Gst.State.PLAYING, Gst.State.PAUSED}
 
 
+    def handle_end(self):
+        """ End of the stream reached: mark frozen and stop frame tick.
+        """
+        self.is_frozen = True
+        self.stop_frame_tick()
+        super(GstOverlay, self).handle_end()
+
+
     def do_play(self):
         """ Start playing the media file.
 
         Returns:
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
+        self.is_frozen = False
         self.update_gpu_target()
         self.playbin.set_state(Gst.State.PLAYING)
 
@@ -308,6 +404,7 @@ class GstOverlay(base.VideoOverlay):
         Returns:
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
+        self.is_frozen = False
         self.update_gpu_target()
         self.playbin.set_state(Gst.State.PLAYING if not self.is_playing() else Gst.State.PAUSED)
         self.start_frame_tick()
@@ -318,6 +415,10 @@ class GstOverlay(base.VideoOverlay):
     def do_stop(self):
         """ Stops playing in the backend player.
         """
+        if self.preview_resize_timer_id is not None:
+            GLib.source_remove(self.preview_resize_timer_id)
+            self.preview_resize_timer_id = None
+        self.is_frozen = False
         self.stop_frame_tick()
         self.playbin.set_state(Gst.State.NULL)
         self.playbin.set_state(Gst.State.READY)
