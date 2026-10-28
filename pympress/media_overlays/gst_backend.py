@@ -350,7 +350,8 @@ class GstOverlay(base.VideoOverlay):
         """
         ret, state, pending = self.playbin.get_state(0)
         is_actively_playing = (state == Gst.State.PLAYING and pending != Gst.State.PAUSED and not self.is_frozen)
-        if is_actively_playing:
+        if is_actively_playing or state in {Gst.State.NULL, Gst.State.READY}:
+            # nothing to draw again: playing, or no frame decoded yet
             return
 
         if self.is_frozen:
