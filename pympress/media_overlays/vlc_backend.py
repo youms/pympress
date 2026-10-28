@@ -29,10 +29,12 @@ logger = logging.getLogger(__name__)
 import os
 import vlc
 import ctypes
+import threading  # noqa: E402
+import tempfile  # noqa: E402
 
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import GLib
+from gi.repository import GLib, Gdk, GdkPixbuf, Gtk  # noqa: E402
 
 from pympress.util import IS_WINDOWS
 from pympress.media_overlays import base
@@ -67,6 +69,8 @@ def get_window_handle(window):
 HIDE_UNTIL_FIRST_FRAME = IS_WINDOWS
 #: Delay (ms) between VLC's first time change event and showing the movie zone
 REVEAL_DELAY_MS = 30
+#: Delay (ms) between the end of the zoom selection and restoring VLC's window, to let the zoom be applied
+UNFREEZE_DELAY_MS = 150
 #: If VLC sends no time change event within this delay (ms), show the movie zone anyway, unless VLC is still starting
 #: (opening, buffering, or playing before its first frame): then check again after the same delay
 REVEAL_TIMEOUT_MS = 1500
@@ -374,7 +378,182 @@ class VlcOverlay(base.VideoOverlay):
             self.handle_end()
         self.last_timestamp = time
         self.update_progress(time)
+        if self._crop_pending:
+            self.apply_crop()
         return False
+
+
+    #: `bool` whether the zoom crop could not be applied yet, because VLC did not know the video size
+    _crop_pending = False
+    #: crop geometry last given to VLC, `None` for no crop
+    _crop_geometry = None
+
+    def apply_crop(self):
+        """ Apply :attr:`~.base.VideoOverlay.crop_fractions` to VLC's crop filter (main thread).
+
+        Returns:
+            `bool`: `False` (:func:`~GLib.idle_add` convention)
+        """
+        if not any(self.crop_fractions) and self._crop_geometry is None:
+            return False  # no zoom: leave VLC alone, in particular while its video output is starting
+
+        width, height = self.player.video_get_size(0)
+        if width <= 0 or height <= 0:
+            self._crop_pending = True  # without a size, try again at the next time change
+            return False
+        self._crop_pending = False
+
+        left, right, top, bottom = self.crop_fractions
+        if not any(self.crop_fractions):
+            geometry = None
+        else:
+            # VLC's crop in pixels: left+top+right+bottom
+            geometry = '{}+{}+{}+{}'.format(*[int(round(v)) for v in (
+                width * left, height * top, width * right, height * bottom)])
+
+        if geometry == self._crop_geometry:
+            return False
+        self._crop_geometry = geometry
+
+        logger.debug('VLC: zoom crop %s on %dx%d, fractions %s', geometry, width, height, self.crop_fractions)
+        # changing VLC's crop restarts its video output, which can wait for the GTK main thread: do not block it
+        threading.Thread(target=self.player.video_set_crop_geometry, args=(geometry,), daemon=True).start()
+        return False
+
+
+    #: `bool` whether a still picture replaces VLC's window while the user selects the zoom area
+    _frozen = False
+    #: `~GdkPixbuf.Pixbuf` of the still picture, and the :class:`~Gtk.DrawingArea` that draws it
+    _still = None
+    _still_area = None
+    _freeze_gen = 0
+
+    def set_pass_through(self, pass_through):
+        """ While the zoom area is selected, show a still picture instead of VLC's window.
+
+        VLC draws in a native window: GTK cannot draw the selection over it without turning it black, and it catches
+        the pointer events. The window is shrunk to a corner and a snapshot of the current picture is drawn in its
+        place, until the selection is over.
+
+        Args:
+            pass_through (`bool`): whether pointer events go through the overlay
+        """
+        super(VlcOverlay, self).set_pass_through(pass_through)
+        self._freeze_gen += 1
+        if pass_through and self.is_shown() and not self.media_type.startswith('audio') and self.has_zoom_selection():
+            self.take_snapshot(self._freeze_gen)
+        elif self._frozen:
+            # let the zoom be applied before showing VLC's window again
+            GLib.timeout_add(UNFREEZE_DELAY_MS, self.unfreeze, self._freeze_gen)
+
+
+    def has_zoom_selection(self):
+        """ Whether the zoom selection is drawn over this overlay: in the presenter window, not in the content window.
+
+        Returns:
+            `bool`: `True` iff the overlay's parent holds the zoom selection widget
+        """
+        return any(child.get_name() == 'zoom-selection' for child in self.parent.get_children())
+
+
+    def take_snapshot(self, gen):
+        """ Save the current picture to a file and show it instead of VLC's window.
+
+        This is done at once, on the main thread: the window turns black as soon as the selection is drawn above it, and
+        taking the snapshot in a thread leaves it black until the snapshot is done.
+
+        Args:
+            gen (`int`): the freeze generation this was started for
+        """
+        fd, path = tempfile.mkstemp(suffix='.png')
+        os.close(fd)
+        if self.player.video_take_snapshot(0, path, 0, 0) == 0:
+            self.freeze(gen, path)
+        else:
+            logger.debug('VLC: no snapshot for the zoom selection')
+            os.remove(path)
+
+
+    def freeze(self, gen, path):
+        """ Shrink VLC's window and draw the snapshot instead. Runs on the main thread.
+
+        Args:
+            gen (`int`): the freeze generation the snapshot was taken for, ignored if the selection is already over
+            path (`str`): the snapshot file, removed here
+
+        Returns:
+            `bool`: `False` (:func:`~GLib.idle_add` convention)
+        """
+        try:
+            if gen == self._freeze_gen and self.pass_through and self.is_shown():
+                self._still = GdkPixbuf.Pixbuf.new_from_file(path)
+                if self._still_area is None:
+                    self._still_area = Gtk.DrawingArea()
+                    self._still_area.set_halign(Gtk.Align.FILL)
+                    self._still_area.set_valign(Gtk.Align.FILL)
+                    self._still_area.connect('draw', self.draw_still)
+                    self._still_area.connect('realize', lambda widget: widget.get_window().set_pass_through(True))
+                    self.parent.add_overlay(self._still_area)
+                    self.parent.set_overlay_pass_through(self._still_area, True)
+                # the still picture goes where the media overlay is, below the selection drawn above the overlays
+                children = self.parent.get_children()
+                position = children.index(self.media_overlay) - (1 if children[0] is self.parent.get_child() else 0)
+                self.parent.reorder_overlay(self._still_area, position)
+                for side in ('left', 'right', 'top', 'bottom'):
+                    self._still_area.set_property('margin-' + side, self.media_overlay.get_property('margin-' + side))
+                self._still_area.show()
+                # hiding and showing VLC's window again leaves its picture black: shrink it to the corner instead
+                self.media_overlay.props.margin_left = max(0, self.parent.get_allocated_width() - 2)
+                self.media_overlay.props.margin_top = max(0, self.parent.get_allocated_height() - 2)
+                self.media_overlay.props.margin_right = 0
+                self.media_overlay.props.margin_bottom = 0
+                self._frozen = True
+                logger.debug('VLC: still picture %dx%d drawn instead of the video',
+                             self._still.get_width(), self._still.get_height())
+        except GLib.Error:
+            logger.exception('VLC: could not load the snapshot for the zoom selection')
+        finally:
+            os.remove(path)
+        return False
+
+
+    def unfreeze(self, gen):
+        """ Show VLC's window again instead of the still picture. Runs on the main thread.
+
+        Args:
+            gen (`int`): the freeze generation this was scheduled for, ignored if a new selection started
+
+        Returns:
+            `bool`: `False` (:func:`~GLib.idle_add` convention)
+        """
+        if gen == self._freeze_gen and self._frozen:
+            self._frozen = False
+            self._still = None
+            self.parent.remove(self._still_area)
+            self._still_area = None
+            self.resize()
+        return False
+
+
+    def draw_still(self, widget, context):
+        """ Draw the still picture over the whole overlay.
+
+        Args:
+            widget (:class:`~Gtk.Widget`):  the widget to update
+            context (:class:`~cairo.Context`):  the Cairo context
+        """
+        if self._still is None:
+            return
+        context.scale(widget.get_allocated_width() / self._still.get_width(),
+                      widget.get_allocated_height() / self._still.get_height())
+        Gdk.cairo_set_source_pixbuf(context, self._still, 0, 0)
+        context.paint()
+
+
+    def apply_window_pass_through(self):
+        """ Leave VLC's native window alone: it is shrunk, not made pass-through, while the zoom area is selected.
+        """
+        pass
 
 
     def do_set_time(self, time):
@@ -408,5 +587,8 @@ class VlcOverlay(base.VideoOverlay):
             # let python find the DLLs
             os.environ['PATH'] = vlc.plugin_path + ';' + os.environ['PATH']
 
+        # the snapshot taken when the zoom area is selected would otherwise show a thumbnail and the name of the file
+        # in the corner of the video
+        vlc_opts = list(vlc_opts) + ['--no-snapshot-preview', '--no-osd']
         VlcOverlay._instance = vlc.Instance(vlc_opts)
         return 'VLC {}'.format(vlc.libvlc_get_version().decode('ascii'))
