@@ -256,6 +256,34 @@ class Media(object):
         self.conf.set(backend, 'enabled', 'on' if enable else 'off')
 
 
+    zoom_scale = 1.0
+    zoom_shift = (0.0, 0.0)
+
+    def set_zoom(self, scale, shift):
+        """ Set zoom scale and shift on all active media overlays.
+
+        Args:
+            scale (float): Cairo zoom scale factor (>= 1.0)
+            shift (tuple of float): (shift_x, shift_y) in normalized slide coordinates
+        """
+        self.zoom_scale = scale
+        self.zoom_shift = shift
+        for overlays in self._media_overlays.values():
+            for overlay in overlays:
+                overlay.set_zoom(scale, shift)
+
+
+    def set_pass_through(self, pass_through):
+        """ Let pointer events go through all media overlays to the slide below them, or catch them again.
+
+        Args:
+            pass_through (`bool`): whether pointer events go through the overlays
+        """
+        for overlays in self._media_overlays.values():
+            for overlay in overlays:
+                overlay.set_pass_through(pass_through)
+
+
     def remove_media_overlays(self):
         """ Remove current media overlays.
         """
@@ -309,6 +337,10 @@ class Media(object):
 
             self._media_overlays[media_id][0].mute(True)
             self._media_overlays[media_id][1].mute(False)
+
+            if self.zoom_scale != 1.0 or self.zoom_shift != (0.0, 0.0):
+                for overlay in self._media_overlays[media_id]:
+                    overlay.set_zoom(self.zoom_scale, self.zoom_shift)
 
             if any(overlay.autoplay for overlay in self._media_overlays[media_id]):
                 GLib.idle_add(self.play, media_id)
@@ -518,6 +550,10 @@ class Zoom(object):
     redraw_current_slide = lambda *args: None
     #: callback, to be connected to :func:`~pympress.ui.UI.clear_cache`
     clear_cache = lambda *args: None
+    #: callback, to be connected to :func:`~pympress.ui.UI.set_media_zoom`
+    set_media_zoom = None
+    #: callback, to be connected to :func:`~pympress.ui.UI.set_media_pass_through`
+    set_media_pass_through = None
 
     def __init__(self, builder):
         super(Zoom, self).__init__()
@@ -525,6 +561,8 @@ class Zoom(object):
 
         self.redraw_current_slide = builder.get_callback_handler('redraw_current_slide')
         self.clear_cache = builder.get_callback_handler('clear_zoom_cache')
+        self.set_media_zoom = builder.get_callback_handler('set_media_zoom')
+        self.set_media_pass_through = builder.get_callback_handler('set_media_pass_through')
         self.set_action_enabled = builder.get_callback_handler('app.set_action_enabled')
 
         builder.setup_actions({
@@ -540,6 +578,7 @@ class Zoom(object):
             `bool`: whether the event was consumed
         """
         self.zoom_selecting = True
+        self.set_media_pass_through(True)
         Cursor.set_cursor(self.p_central, 'crosshair')
 
         return True
@@ -553,6 +592,7 @@ class Zoom(object):
         """
         Cursor.set_cursor(self.p_central)
         self.zoom_selecting = False
+        self.set_media_pass_through(False)
         self.zoom_points = None
         self.scale = 1.
         self.shift = (0, 0)
@@ -560,8 +600,15 @@ class Zoom(object):
 
         self.redraw_current_slide()
         self.clear_cache()
+        self.apply_zoom_to_medias()
 
         return True
+
+
+    def apply_zoom_to_medias(self):
+        """ Propagate current zoom scale and shift to active media overlays.
+        """
+        self.set_media_zoom(self.scale, self.shift)
 
 
     def try_cancel(self):
@@ -575,6 +622,7 @@ class Zoom(object):
 
         Cursor.set_cursor(self.p_central)
         self.zoom_selecting = False
+        self.set_media_pass_through(False)
         self.zoom_points = None
         return True
 
@@ -677,8 +725,10 @@ class Zoom(object):
             Cursor.set_cursor(self.p_central)
 
             self.zoom_selecting = False
+            self.set_media_pass_through(False)
             self.clear_cache()
             self.redraw_current_slide()
+            self.apply_zoom_to_medias()
             self.set_action_enabled('unzoom', True)
 
             return True

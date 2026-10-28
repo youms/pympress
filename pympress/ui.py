@@ -1365,6 +1365,25 @@ class UI(builder.Builder):
         self.cache.clear_cache(self.scribbler.scribble_p_da.get_name() + '_zoomed')
 
 
+    def set_media_zoom(self, scale, shift):
+        """ Callback to make the media overlays follow the zoom of the slides.
+
+        Args:
+            scale (`float`): the zoom factor
+            shift (`tuple` of `float`): the shift in normalized slide coordinates
+        """
+        self.medias.set_zoom(scale, shift)
+
+
+    def set_media_pass_through(self, pass_through):
+        """ Callback to let the media overlays pass pointer events to the slides while the zoom area is selected.
+
+        Args:
+            pass_through (`bool`): whether pointer events go through the overlays
+        """
+        self.medias.set_pass_through(pass_through)
+
+
     def redraw_current_slide(self):
         """ Callback to queue a redraw of the current slides (in both winows).
         """
