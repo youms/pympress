@@ -171,6 +171,7 @@ class GstOverlay(base.VideoOverlay):
         self.playbin.set_property('video-sink', self.sink)
         self.setup_gpu_conversion()
         self.setup_crop_filter()
+        self.setup_audio_filter()
 
         super(GstOverlay, self).__init__(*args, **kwargs)
 
@@ -198,6 +199,7 @@ class GstOverlay(base.VideoOverlay):
         bus.connect('message::error', lambda _, msg: logger.error('{} {}'.format(*msg.parse_error())))
         bus.connect('message::state-changed', self.on_state_changed)
         bus.connect('sync-message::element', self.on_sync_element)
+        bus.connect('message::element', self.on_element_message)
         bus.connect('message::duration-changed', lambda *args: GLib.idle_add(self.do_update_duration))
 
 
@@ -346,6 +348,39 @@ class GstOverlay(base.VideoOverlay):
 
         self.repaint_still_frame()
         return False
+
+
+    #: `Gst.Element` the `level` element that reports the audio levels shown by the meter, or `None`
+    audio_level_filter = None
+
+    def setup_audio_filter(self):
+        """ Add a `level` element to the playbin audio filter, to report the levels for the audio meter.
+        """
+        if Gst.ElementFactory.find('level') is None or self.playbin.get_property('audio-filter') is not None:
+            return
+
+        self.audio_level_filter = Gst.ElementFactory.make('level', None)
+        # 50 ms between messages, for a smooth meter
+        self.audio_level_filter.set_property('interval', 50 * Gst.MSECOND)
+        self.audio_level_filter.set_property('post-messages', True)
+        self.playbin.set_property('audio-filter', self.audio_level_filter)
+
+
+    def on_element_message(self, bus, msg):
+        """ Show the peak level reported by the `level` element on the audio meter.
+
+        Args:
+            bus (:class:`~Gst.Bus`): the bus that sent the message
+            msg (:class:`~Gst.Message`): the element message
+        """
+        s = msg.get_structure()
+        if s is None or s.get_name() != 'level':
+            return
+
+        peaks = s.get_value('peak')
+        if peaks:
+            # map -60 dBFS .. 0 dBFS to 0 .. 1
+            GLib.idle_add(self.update_audio_meter, max(0.0, min(1.0, (max(peaks) + 60.0) / 60.0)))
 
 
     def repaint_still_frame(self):
@@ -783,6 +818,7 @@ class GstOverlay(base.VideoOverlay):
     def handle_end(self):
         """ End of the stream reached: mark frozen and stop frame tick.
         """
+        GLib.idle_add(self.update_audio_meter, 0.0)
         self.is_frozen = True
         self.stop_frame_tick()
         super(GstOverlay, self).handle_end()
@@ -816,7 +852,10 @@ class GstOverlay(base.VideoOverlay):
         if (self.use_d3d9_sink and not self.is_playing() and self.playbin.get_state(0)[1] != Gst.State.PAUSED and
                 not self.prepare_d3d9_play()):
             return False
-        self.playbin.set_state(Gst.State.PLAYING if not self.is_playing() else Gst.State.PAUSED)
+        new_state = Gst.State.PLAYING if not self.is_playing() else Gst.State.PAUSED
+        if new_state == Gst.State.PAUSED:
+            GLib.idle_add(self.update_audio_meter, 0.0)
+        self.playbin.set_state(new_state)
         self.start_frame_tick()
 
         return False
@@ -825,6 +864,7 @@ class GstOverlay(base.VideoOverlay):
     def do_stop(self):
         """ Stops playing in the backend player.
         """
+        GLib.idle_add(self.update_audio_meter, 0.0)
         if self.preview_resize_timer_id is not None:
             GLib.source_remove(self.preview_resize_timer_id)
             self.preview_resize_timer_id = None

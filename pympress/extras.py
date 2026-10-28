@@ -332,6 +332,8 @@ class Media(object):
 
                 v_da_c = factory(self.c_overlay, page_type, action_group, media)
                 v_da_p = factory(self.p_overlay, page_type, action_group, media._replace(show_controls=True))
+                v_da_c.partner = v_da_p
+                v_da_p.partner = v_da_c
 
                 self._media_overlays[media_id] = (v_da_c, v_da_p)
 

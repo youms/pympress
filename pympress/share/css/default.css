@@ -99,3 +99,22 @@
 .grid-frame > *:hover {
   border-color: @theme_selected_bg_color;
 }
+
+levelbar.audio-meter trough {
+  background-color: rgba(0, 0, 0, 0.25);
+  border-left: 1px solid rgba(255, 255, 255, 0.15);
+  border-top: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+  min-width: 6px;
+}
+
+levelbar.audio-meter block.empty {
+  background-image: none;
+  background-color: transparent;
+}
+
+levelbar.audio-meter block:not(.empty) {
+  background-image: linear-gradient(to top, rgba(46, 160, 67, 0.75) 0%, rgba(210, 153, 34, 0.85) 75%, rgba(248, 81, 73, 0.95) 100%);
+  border-radius: 1px;
+  min-width: 6px;
+}

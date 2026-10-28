@@ -58,6 +58,10 @@ class VideoOverlay(builder.Builder):
     media_overlay = None
     #: A :class:`~Gtk.HBox` containing a toolbar with buttons and :attr:`~progress` the progress bar
     toolbar = None
+    #: :class:`~Gtk.LevelBar` live audio level bar on the video overlay.
+    audio_meter = None
+    #: :class:`~VideoOverlay` partner overlay for the other window (presenter <-> content).
+    partner = None
     #: :class:`~Gtk.Scale` that is the progress bar in the controls toolbar - if we have one.
     progress = None
     #: :class:`~Gtk.DrawingArea` where the media is rendered.
@@ -110,6 +114,12 @@ class VideoOverlay(builder.Builder):
 
         self.load_ui('media_overlay')
         self.toolbar.set_visible(media.show_controls)
+
+        if self.audio_meter is not None:
+            self.audio_meter.get_style_context().add_class('audio-meter')
+            self.audio_meter.set_visible(media.show_controls)
+            if isinstance(self.media_overlay, Gtk.Overlay):
+                self.media_overlay.connect('size-allocate', self._on_overlay_size_allocate)
 
         self._floating_controls = media.show_controls and isinstance(self.media_overlay, Gtk.Overlay)
         self._pointer_poll = None
@@ -224,6 +234,28 @@ class VideoOverlay(builder.Builder):
         elif opacity > target:
             self.toolbar.set_opacity(max(opacity - .08, target))
         return True
+
+
+    def _on_overlay_size_allocate(self, widget, allocation):
+        """ Maintain audio level bar height at up to 1/3 of the video overlay height. """
+        if self.audio_meter is not None:
+            target_height = max(24, int(allocation.height / 3))
+            curr_w, curr_h = self.audio_meter.get_size_request()
+            if curr_h != target_height:
+                self.audio_meter.set_size_request(6, target_height)
+
+
+    def update_audio_meter(self, level):
+        """ Update audio level bar value.
+
+        Args:
+            level (float): Normalized audio level between 0.0 and 1.0
+        """
+        if self.audio_meter is not None:
+            self.audio_meter.set_value(max(0.0, min(1.0, level)))
+        if self.partner is not None and getattr(self.partner, 'audio_meter', None) is not None:
+            self.partner.audio_meter.set_value(max(0.0, min(1.0, level)))
+        return False
 
 
     def handle_embed(self, mapped_widget):
