@@ -175,8 +175,11 @@ class GstOverlay(base.VideoOverlay):
         super(GstOverlay, self).__init__(*args, **kwargs)
 
         self.media_overlay.remove(self.movie_zone)
-        self.media_overlay.pack_start(self.video_widget, True, True, 0)
-        self.media_overlay.reorder_child(self.video_widget, 0)
+        if isinstance(self.media_overlay, Gtk.Overlay):
+            self.media_overlay.add(self.video_widget)
+        else:
+            self.media_overlay.pack_start(self.video_widget, True, True, 0)
+            self.media_overlay.reorder_child(self.video_widget, 0)
         self.video_widget.hide()
         if self.use_d3d9_sink:
             # follow the content window when it moves or changes size (e.g. fullscreen toggled)
@@ -385,7 +388,7 @@ class GstOverlay(base.VideoOverlay):
         mo = self.media_overlay
         w = self.parent.get_allocated_width() - mo.props.margin_left - mo.props.margin_right
         h = self.parent.get_allocated_height() - mo.props.margin_top - mo.props.margin_bottom
-        if self.toolbar.get_visible():
+        if not isinstance(self.media_overlay, Gtk.Overlay) and self.toolbar.get_visible():
             h -= self.toolbar.get_preferred_height()[1]
         scale = self.parent.get_scale_factor()
         self.gpu_target = (int(w * scale), int(h * scale)) if w >= 16 and h >= 16 else None
@@ -536,7 +539,7 @@ class GstOverlay(base.VideoOverlay):
         mo = self.media_overlay
         w = self.parent.get_allocated_width() - mo.props.margin_left - mo.props.margin_right
         h = self.parent.get_allocated_height() - mo.props.margin_top - mo.props.margin_bottom
-        if self.toolbar.get_visible():
+        if not isinstance(self.media_overlay, Gtk.Overlay) and self.toolbar.get_visible():
             h -= self.toolbar.get_preferred_height()[1]
         if w < 16 or h < 16:
             return None

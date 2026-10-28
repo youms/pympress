@@ -2,15 +2,24 @@
 <!-- Generated with glade 3.38.2 -->
 <interface>
   <requires lib="gtk+" version="3.2"/>
-  <object class="GtkBox" id="media_overlay">
+  <object class="GtkOverlay" id="media_overlay">
     <property name="visible">True</property>
     <property name="can-focus">False</property>
-    <property name="orientation">vertical</property>
     <signal name="map" handler="handle_embed" swapped="no"/>
     <child>
+      <object class="GtkDrawingArea" id="movie_zone">
+        <property name="visible">True</property>
+        <property name="can-focus">False</property>
+        <property name="events">GDK_BUTTON_PRESS_MASK | GDK_STRUCTURE_MASK</property>
+        <signal name="button-press-event" handler="play_pause" swapped="no"/>
+      </object>
+    </child>
+    <child type="overlay">
       <object class="GtkBox" id="toolbar">
         <property name="visible">True</property>
         <property name="can-focus">False</property>
+        <property name="valign">end</property>
+        <property name="halign">fill</property>
         <child>
           <object class="GtkToolbar">
             <property name="visible">True</property>
@@ -81,28 +90,9 @@
         </child>
         <style>
           <class name="toolbar"/>
+          <class name="osd"/>
         </style>
       </object>
-      <packing>
-        <property name="expand">False</property>
-        <property name="fill">False</property>
-        <property name="pack-type">end</property>
-        <property name="position">0</property>
-      </packing>
-    </child>
-    <child>
-      <object class="GtkDrawingArea" id="movie_zone">
-        <property name="visible">True</property>
-        <property name="can-focus">False</property>
-        <property name="events">GDK_BUTTON_PRESS_MASK | GDK_STRUCTURE_MASK</property>
-        <signal name="button-press-event" handler="play_pause" swapped="no"/>
-      </object>
-      <packing>
-        <property name="expand">True</property>
-        <property name="fill">True</property>
-        <property name="pack-type">end</property>
-        <property name="position">1</property>
-      </packing>
     </child>
   </object>
 </interface>

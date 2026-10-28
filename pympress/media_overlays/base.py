@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import GLib, Gio
+from gi.repository import Gtk, GLib, Gio  # noqa: E402
 
 from pympress import document, builder
 
@@ -88,6 +88,13 @@ class VideoOverlay(builder.Builder):
     #: `float` holding the max time in s
     maxval = 1
 
+    #: `float` time in s without the pointer moving after which the floating controls fade out while playing
+    toolbar_idle = 2.5
+    #: `float` opacity of the floating controls once faded out
+    toolbar_faded_opacity = .2
+    #: `int` interval in ms at which the pointer position is looked at to fade the floating controls
+    pointer_poll_interval = 50
+
     #: :class:`~Gio.ActionMap` containing the actios for this video overlay
     action_map = None
 
@@ -100,6 +107,11 @@ class VideoOverlay(builder.Builder):
 
         self.load_ui('media_overlay')
         self.toolbar.set_visible(media.show_controls)
+
+        self._floating_controls = media.show_controls and isinstance(self.media_overlay, Gtk.Overlay)
+        self._pointer_poll = None
+        self._pointer_pos = None
+        self._pointer_moved = 0
 
         self.connect_signals(self)
 
@@ -118,6 +130,75 @@ class VideoOverlay(builder.Builder):
         self.autoplay = media.autoplay
         self.repeat = media.repeat
         # TODO: handle poster
+
+
+    def _start_pointer_poll(self):
+        """ Start following the pointer, to fade the floating controls in and out.
+
+        This looks at where the pointer is instead of waiting for GTK's motion events, because a video drawn in its own
+        native window (VLC) does not pass those on.
+        """
+        if self._floating_controls and self._pointer_poll is None:
+            self._pointer_pos = None
+            self._pointer_moved = GLib.get_monotonic_time()
+            self._pointer_poll = GLib.timeout_add(self.pointer_poll_interval, self._poll_pointer)
+
+
+    def _stop_pointer_poll(self):
+        """ Stop following the pointer, and show the controls fully again.
+        """
+        if self._pointer_poll is not None:
+            GLib.source_remove(self._pointer_poll)
+            self._pointer_poll = None
+        self.toolbar.set_opacity(1.)
+
+
+    @staticmethod
+    def _contains(widget, x, y):
+        """ Tell whether a position on the screen is over a widget.
+
+        Args:
+            widget (:class:`~Gtk.Widget`): the widget
+            x (`int`): the horizontal position on the screen
+            y (`int`): the vertical position on the screen
+
+        Returns:
+            `bool`: `True` iff the position is within the widget's area
+        """
+        window = widget.get_window()
+        if window is None or not widget.get_mapped():
+            return False
+
+        alloc = widget.get_allocation()
+        _, left, top = window.get_origin()
+        if not widget.get_has_window():
+            left, top = left + alloc.x, top + alloc.y
+        return left <= x < left + alloc.width and top <= y < top + alloc.height
+
+
+    def _poll_pointer(self):
+        """ Fade the floating controls in or out, depending on the pointer.
+
+        The controls are opaque when the media is not playing, when the pointer is on them, or when it recently moved
+        over the video. Otherwise they fade out.
+
+        Returns:
+            `bool`: `True` to keep polling (:func:`~GLib.timeout_add` convention)
+        """
+        _, x, y = self.media_overlay.get_display().get_default_seat().get_pointer().get_position()
+        now = GLib.get_monotonic_time()
+        if (x, y) != self._pointer_pos:
+            self._pointer_pos, self._pointer_moved = (x, y), now
+
+        shown = (not self.is_playing() or self._contains(self.toolbar, x, y) or
+                 (self._contains(self.media_overlay, x, y) and (now - self._pointer_moved) / 1e6 < self.toolbar_idle))
+        target = 1. if shown else self.toolbar_faded_opacity
+        opacity = self.toolbar.get_opacity()
+        if opacity < target:
+            self.toolbar.set_opacity(min(opacity + .25, target))
+        elif opacity > target:
+            self.toolbar.set_opacity(max(opacity - .08, target))
+        return True
 
 
     def handle_embed(self, mapped_widget):
@@ -233,6 +314,8 @@ class VideoOverlay(builder.Builder):
         self.pass_through = pass_through
         if self.is_shown():
             self.parent.set_overlay_pass_through(self.media_overlay, pass_through)
+        if isinstance(self.media_overlay, Gtk.Overlay):
+            self.media_overlay.set_overlay_pass_through(self.toolbar, pass_through)
         self.apply_window_pass_through()
 
 
@@ -370,6 +453,7 @@ class VideoOverlay(builder.Builder):
             self.parent.queue_draw()
         self.media_overlay.show()
         self.apply_window_pass_through()
+        self._start_pointer_poll()
 
 
     def do_hide(self, *args):
@@ -378,6 +462,7 @@ class VideoOverlay(builder.Builder):
         Returns:
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
+        self._stop_pointer_poll()
         self.do_stop()
         self.media_overlay.hide()
 
