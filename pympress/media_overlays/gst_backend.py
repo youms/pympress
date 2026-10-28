@@ -172,6 +172,11 @@ class GstOverlay(base.VideoOverlay):
         if self.use_d3d9_sink:
             # follow the content window when it moves or changes size (e.g. fullscreen toggled)
             self.parent.connect('size-allocate', lambda *args: self.place_popup())
+            # ... and when it moves without changing size (dragged as a window): size-allocate does not fire then, and
+            # the popup would stay at the old place, showing the video over whatever is there
+            toplevel = self.parent.get_toplevel()
+            if toplevel is not None and toplevel.is_toplevel():
+                toplevel.connect('configure-event', self.on_toplevel_configure)
 
         # Create bus to get events from GStreamer playin
         bus = self.playbin.get_bus()
@@ -224,6 +229,16 @@ class GstOverlay(base.VideoOverlay):
         """
         if self.gpu_size_filter is None:
             return
+        if self.use_d3d9_sink:
+            # The popup gets frames at the size of the screen it is on, not of the window. The size is fixed when
+            # playback starts, so a video started in a window would otherwise stay at the window's size (blurry) after
+            # going fullscreen. d3dvideosink scales down to a smaller window on the GPU.
+            gdk_window = self.parent.get_window()
+            monitor = self.parent.get_display().get_monitor_at_window(gdk_window) if gdk_window is not None else None
+            if monitor is not None:
+                geometry, scale = monitor.get_geometry(), monitor.get_scale_factor()
+                self.gpu_target = (geometry.width * scale, geometry.height * scale)
+                return
         mo = self.media_overlay
         w = self.parent.get_allocated_width() - mo.props.margin_left - mo.props.margin_right
         h = self.parent.get_allocated_height() - mo.props.margin_top - mo.props.margin_bottom
@@ -333,6 +348,21 @@ class GstOverlay(base.VideoOverlay):
                                     (y0 - ty + py + mo.props.margin_top) * scale)
         user32.ClientToScreen(owner, point)
         return owner, point[0], point[1], w * scale, h * scale
+
+
+    def on_toplevel_configure(self, widget, event):
+        """ The content window moved or changed size: move the popup with it, once GTK has handled the change.
+
+        Args:
+            widget (:class:`~Gtk.Widget`): the content window
+            event (:class:`~Gdk.EventConfigure`): the configure event
+
+        Returns:
+            `bool`: `False`, to let GTK handle the event as well
+        """
+        if self.popup is not None:
+            GLib.idle_add(lambda: self.place_popup() and False)
+        return False
 
 
     def place_popup(self):
