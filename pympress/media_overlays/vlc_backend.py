@@ -189,6 +189,10 @@ class VlcOverlay(base.VideoOverlay):
             # VLC repeats the input itself: restarting the player at its end closes and reopens the video output,
             # which shows black between two loops
             media.add_option(':input-repeat=65535')
+        elif self.end_action == 'freeze' and not self.repeat:
+            # VLC pauses on the last frame instead of ending: an ended player has no video output left to take a
+            # snapshot of or to draw a zoomed crop in
+            media.add_option(':play-and-pause')
         if self._no_audio:
             media.add_option(':no-audio')
         self.player.set_media(media)
@@ -467,7 +471,7 @@ class VlcOverlay(base.VideoOverlay):
         """
         fd, path = tempfile.mkstemp(suffix='.png')
         os.close(fd)
-        if self.player.video_take_snapshot(0, path, 0, 0) == 0:
+        if self.player.video_take_snapshot(0, path, 0, 0) == 0 and os.path.getsize(path) > 0:
             self.freeze(gen, path)
         else:
             logger.debug('VLC: no snapshot for the zoom selection')
