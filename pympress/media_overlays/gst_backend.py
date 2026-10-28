@@ -248,34 +248,39 @@ class GstOverlay(base.VideoOverlay):
 
         The crop makes the frames smaller, and gtksink can get stuck on the old size when the size shrinks mid-stream
         (see :meth:`on_video_widget_allocated`): it then draws nothing, with one critical message per frame. So the
-        frames are scaled back to the size they had, and the sink always gets the same size.
+        frames are scaled back to the size they had, and the sink always gets the same size. `d3dvideosink` scales the
+        frames to its window on the GPU and has no such problem, so there the scaling is left out: doing it on the CPU
+        for every frame of a full screen video makes the video stall.
         """
         if any(Gst.ElementFactory.find(name) is None for name in ('videocrop', 'videoscale', 'capsfilter')):
             return
 
         crop = Gst.ElementFactory.make('videocrop', 'zoomcrop')
-        scale = Gst.ElementFactory.make('videoscale', 'zoomscale')
-        size = Gst.ElementFactory.make('capsfilter', 'zoomsize')
+        elements = [crop]
+        size = None
+        if not self.use_d3d9_sink:
+            size = Gst.ElementFactory.make('capsfilter', 'zoomsize')
+            elements += [Gst.ElementFactory.make('videoscale', 'zoomscale'), size]
         video_filter = self.playbin.get_property('video-filter')
 
         if video_filter is None:
             video_filter = Gst.Bin.new('zoomfilter')
-            for element in (crop, scale, size):
+            for element in elements:
                 video_filter.add(element)
-            if not crop.link(scale) or not scale.link(size):
+            if not all(a.link(b) for a, b in zip(elements, elements[1:])):
                 logger.warning('Zoom crop not set up: cannot link videocrop and videoscale')
                 return
             video_filter.add_pad(Gst.GhostPad.new('sink', crop.get_static_pad('sink')))
-            video_filter.add_pad(Gst.GhostPad.new('src', size.get_static_pad('src')))
+            video_filter.add_pad(Gst.GhostPad.new('src', elements[-1].get_static_pad('src')))
             self.playbin.set_property('video-filter', video_filter)
         elif isinstance(video_filter, Gst.Bin):
             ghost = video_filter.get_static_pad('src')
             last = ghost.get_target().get_parent_element()
-            for element in (crop, scale, size):
+            for element in elements:
                 video_filter.add(element)
             ghost.set_target(None)
-            linked = (last.link(crop) and crop.link(scale) and scale.link(size) and
-                      ghost.set_target(size.get_static_pad('src')))
+            linked = (last.link(crop) and all(a.link(b) for a, b in zip(elements, elements[1:])) and
+                      ghost.set_target(elements[-1].get_static_pad('src')))
             if not linked:
                 logger.warning('Zoom crop not set up: cannot add videocrop to the GPU conversion')
                 return
@@ -301,11 +306,12 @@ class GstOverlay(base.VideoOverlay):
             ok_h, h = s.get_int('height')
             if ok_w and ok_h:
                 self.crop_input_size = (w, h)
-                caps = 'video/x-raw,width={},height={}'.format(w, h)
-                ok_par, par_n, par_d = s.get_fraction('pixel-aspect-ratio')
-                if ok_par:
-                    caps += ',pixel-aspect-ratio={}/{}'.format(par_n, par_d)
-                self.crop_size_filter.set_property('caps', Gst.Caps.from_string(caps))
+                if self.crop_size_filter is not None:
+                    caps = 'video/x-raw,width={},height={}'.format(w, h)
+                    ok_par, par_n, par_d = s.get_fraction('pixel-aspect-ratio')
+                    if ok_par:
+                        caps += ',pixel-aspect-ratio={}/{}'.format(par_n, par_d)
+                    self.crop_size_filter.set_property('caps', Gst.Caps.from_string(caps))
                 self.set_crop(w, h)
                 if any(self.crop_fractions):
                     GLib.idle_add(self.repaint_still_frame)
