@@ -67,7 +67,8 @@ def get_window_handle(window):
 HIDE_UNTIL_FIRST_FRAME = IS_WINDOWS
 #: Delay (ms) between VLC's first time change event and showing the movie zone
 REVEAL_DELAY_MS = 30
-#: Show the movie zone after this delay (ms) even if VLC sends no time change event
+#: If VLC sends no time change event within this delay (ms), show the movie zone anyway, unless VLC is still starting
+#: (opening, buffering, or playing before its first frame): then check again after the same delay
 REVEAL_TIMEOUT_MS = 1500
 #: Delay (ms) between hiding the movie zone and stopping the player and removing the overlay
 REMOVE_DELAY_MS = 150
@@ -140,6 +141,12 @@ class VlcOverlay(base.VideoOverlay):
             `bool`: `False` (:func:`~GLib.timeout_add` convention)
         """
         if gen == self._reveal_gen:
+            if self._reveal_pending and self.player.get_state() in {vlc.State.Opening, vlc.State.Buffering,
+                                                                    vlc.State.Playing}:
+                # VLC can take seconds to start (first video after a reboot): showing the zone before VLC presents
+                # its first frame puts the black backdrop over the slide. Keep showing the slide and check again.
+                GLib.timeout_add(REVEAL_TIMEOUT_MS, self.reveal, gen)
+                return False
             self._reveal_gen += 1
             self._reveal_pending = False
             if self.is_shown():
