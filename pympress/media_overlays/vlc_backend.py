@@ -445,7 +445,10 @@ class VlcOverlay(base.VideoOverlay):
         super(VlcOverlay, self).set_pass_through(pass_through)
         self._freeze_gen += 1
         if pass_through and self.is_shown() and not self.media_type.startswith('audio') and self.has_zoom_selection():
-            self.take_snapshot(self._freeze_gen)
+            # a second request while the picture is already still keeps it: the overlay is shrunk by now, and its
+            # margins would shrink the still picture as well
+            if not self._frozen:
+                self.take_snapshot(self._freeze_gen)
         elif self._frozen:
             # let the zoom be applied before showing VLC's window again
             GLib.timeout_add(UNFREEZE_DELAY_MS, self.unfreeze, self._freeze_gen)
