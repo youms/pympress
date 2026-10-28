@@ -84,6 +84,10 @@ class VlcOverlay(base.VideoOverlay):
     Its player can be controlled through the 'player' attribute, which is a :class:`~vlc.MediaPlayer` instance.
     """
 
+    #: `float` opacity of the floating controls once faded out: VLC draws in its own native window, which GTK cannot
+    #: blend the controls with, and which an invisible but mapped widget would cover in black, so they are hidden
+    toolbar_faded_opacity = None
+
     #: A single vlc.Instance() to be shared by (possible) multiple players.
     _instance = None
     #: `bool` that tracks whether the movie zone is hidden until VLC presents its first frame
@@ -159,7 +163,20 @@ class VlcOverlay(base.VideoOverlay):
             self._reveal_pending = False
             if self.is_shown():
                 self.movie_zone.set_child_visible(True)
+                self._raise_controls()
         return False
+
+
+    def _raise_controls(self):
+        """ Give the floating controls a native window above the video's, otherwise the video covers them.
+
+        The video is drawn in a native window of its own, and GTK paints the controls into the window of their parent
+        and so under that one, until VLC has started presenting moving frames.
+        """
+        window = self.toolbar.get_window() if self._floating_controls else None
+        if window is not None:
+            window.ensure_native()
+            window.raise_()
 
 
     def is_playing(self):
@@ -288,6 +305,7 @@ class VlcOverlay(base.VideoOverlay):
             # do_hide() left the zone child-invisible: it needs its window again for handle_embed()
             self.movie_zone.set_child_visible(True)
         super(VlcOverlay, self).show()
+        self._raise_controls()
         self.movie_zone.queue_draw()
 
 

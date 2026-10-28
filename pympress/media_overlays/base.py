@@ -88,9 +88,12 @@ class VideoOverlay(builder.Builder):
     #: `float` holding the max time in s
     maxval = 1
 
+    #: `bool` whether the stream reached its end and the player stays on the last frame
+    is_frozen = False
+
     #: `float` time in s without the pointer moving after which the floating controls fade out while playing
     toolbar_idle = 2.5
-    #: `float` opacity of the floating controls once faded out
+    #: `float` opacity of the floating controls once faded out, or `None` to hide them instead
     toolbar_faded_opacity = .2
     #: `int` interval in ms at which the pointer position is looked at to fade the floating controls
     pointer_poll_interval = 50
@@ -111,7 +114,9 @@ class VideoOverlay(builder.Builder):
         self._floating_controls = media.show_controls and isinstance(self.media_overlay, Gtk.Overlay)
         self._pointer_poll = None
         self._pointer_pos = None
-        self._pointer_moved = 0
+        self._activity = 0
+        self._was_playing = False
+        self._controls_shown = True
 
         self.connect_signals(self)
 
@@ -140,7 +145,9 @@ class VideoOverlay(builder.Builder):
         """
         if self._floating_controls and self._pointer_poll is None:
             self._pointer_pos = None
-            self._pointer_moved = GLib.get_monotonic_time()
+            self._was_playing = False
+            self._controls_shown = True
+            self._activity = GLib.get_monotonic_time()
             self._pointer_poll = GLib.timeout_add(self.pointer_poll_interval, self._poll_pointer)
 
 
@@ -151,6 +158,8 @@ class VideoOverlay(builder.Builder):
             GLib.source_remove(self._pointer_poll)
             self._pointer_poll = None
         self.toolbar.set_opacity(1.)
+        if self._floating_controls:
+            self.toolbar.show()
 
 
     @staticmethod
@@ -179,19 +188,35 @@ class VideoOverlay(builder.Builder):
     def _poll_pointer(self):
         """ Fade the floating controls in or out, depending on the pointer.
 
-        The controls are opaque when the media is not playing, when the pointer is on them, or when it recently moved
-        over the video. Otherwise they fade out.
+        The controls are opaque when the media is not playing, when the pointer is on them, and for a few seconds after
+        the slide is reached, the media starts playing, or the pointer moves over the video. Otherwise they fade out.
 
         Returns:
             `bool`: `True` to keep polling (:func:`~GLib.timeout_add` convention)
         """
         _, x, y = self.media_overlay.get_display().get_default_seat().get_pointer().get_position()
         now = GLib.get_monotonic_time()
+        playing = self.is_playing() and not self.is_frozen
         if (x, y) != self._pointer_pos:
-            self._pointer_pos, self._pointer_moved = (x, y), now
+            self._pointer_pos = (x, y)
+            if self._contains(self.media_overlay, x, y):
+                self._activity = now
+        if playing and not self._was_playing:
+            self._activity = now
+        self._was_playing = playing
 
-        shown = (not self.is_playing() or self._contains(self.toolbar, x, y) or
-                 (self._contains(self.media_overlay, x, y) and (now - self._pointer_moved) / 1e6 < self.toolbar_idle))
+        shown = (not playing or self._contains(self.toolbar, x, y) or (now - self._activity) / 1e6 < self.toolbar_idle)
+        if shown != self._controls_shown:
+            self._controls_shown = shown
+            logger.debug('Floating controls %s: playing=%s, frozen=%s, idle=%.1fs', 'shown' if shown else 'faded out',
+                         playing, self.is_frozen, (now - self._activity) / 1e6)
+
+        if shown and not self.toolbar.get_visible():
+            self.toolbar.show()
+        elif not shown and self.toolbar_faded_opacity is None:
+            self.toolbar.hide()
+            return True
+
         target = 1. if shown else self.toolbar_faded_opacity
         opacity = self.toolbar.get_opacity()
         if opacity < target:
