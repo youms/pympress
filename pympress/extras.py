@@ -576,6 +576,7 @@ class Zoom(object):
 
         # A video is drawn above the slide, which would hide the selection drawn on the slide
         self.selection_da = Gtk.DrawingArea()
+        self.selection_da.set_name('zoom-selection')
         self.selection_da.connect('draw', self.draw_selection_overlay)
         self.selection_da.connect('realize', lambda widget: widget.get_window().set_pass_through(True))
         self.p_overlay.add_overlay(self.selection_da)
@@ -592,9 +593,20 @@ class Zoom(object):
         self.zoom_selecting = True
         self.set_media_pass_through(True)
         Cursor.set_cursor(self.p_central, 'crosshair')
-        self.p_overlay.reorder_overlay(self.selection_da, -1)
+        self.set_selection_on_top(True)
 
         return True
+
+
+    def set_selection_on_top(self, on_top):
+        """ Draw the selection above the media overlays while the area is selected, below them otherwise.
+
+        A native video window (VLC) turns black when a widget stays above it.
+
+        Args:
+            on_top (`bool`): whether the selection goes above the media overlays
+        """
+        self.p_overlay.reorder_overlay(self.selection_da, -1 if on_top else 0)
 
 
     def stop_zooming(self, *args):
@@ -605,6 +617,7 @@ class Zoom(object):
         """
         Cursor.set_cursor(self.p_central)
         self.zoom_selecting = False
+        self.set_selection_on_top(False)
         self.set_media_pass_through(False)
         self.zoom_points = None
         self.scale = 1.
@@ -642,6 +655,7 @@ class Zoom(object):
 
         Cursor.set_cursor(self.p_central)
         self.zoom_selecting = False
+        self.set_selection_on_top(False)
         self.set_media_pass_through(False)
         self.zoom_points = None
         return True
@@ -745,6 +759,7 @@ class Zoom(object):
             Cursor.set_cursor(self.p_central)
 
             self.zoom_selecting = False
+            self.set_selection_on_top(False)
             self.set_media_pass_through(False)
             self.clear_cache()
             self.redraw_zoom()
