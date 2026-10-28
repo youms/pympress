@@ -1569,6 +1569,11 @@ class UI(builder.Builder):
         if event.type != Gdk.EventType.MOTION_NOTIFY:
             return False
 
+        if self.zoom.zoom_selecting:
+            # keep the crosshair of the zoom selection, also over a link: the area of a video is one
+            extras.Cursor.set_cursor(widget, 'parent')
+            return True
+
         # Where did the event occur?
         if widget in self.p_das_next:
             offset = 1 + int(widget.get_name()[len('p_da_next'):])

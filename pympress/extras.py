@@ -543,6 +543,10 @@ class Zoom(object):
 
     #: :class:`~Gtk.Box` in the Presenter window, used to reliably set cursors.
     p_central = None
+    #: :class:`~Gtk.Overlay` in the Presenter window containing the current slide and the media overlays
+    p_overlay = None
+    #: :class:`~Gtk.DrawingArea` above the media overlays, to draw the zoom selection over a video
+    selection_da = None
     #: callback, to be connected to :meth:`~pympress.app.Pympress.set_action_enabled`
     set_action_enabled = None
 
@@ -570,6 +574,14 @@ class Zoom(object):
             'unzoom': dict(activate=self.stop_zooming),
         })
 
+        # A video is drawn above the slide, which would hide the selection drawn on the slide
+        self.selection_da = Gtk.DrawingArea()
+        self.selection_da.connect('draw', self.draw_selection_overlay)
+        self.selection_da.connect('realize', lambda widget: widget.get_window().set_pass_through(True))
+        self.p_overlay.add_overlay(self.selection_da)
+        self.p_overlay.set_overlay_pass_through(self.selection_da, True)
+        self.selection_da.show()
+
 
     def start_zooming(self, *args):
         """ Setup for the user to select the zooming area.
@@ -580,6 +592,7 @@ class Zoom(object):
         self.zoom_selecting = True
         self.set_media_pass_through(True)
         Cursor.set_cursor(self.p_central, 'crosshair')
+        self.p_overlay.reorder_overlay(self.selection_da, -1)
 
         return True
 
@@ -598,11 +611,18 @@ class Zoom(object):
         self.shift = (0, 0)
         self.set_action_enabled('unzoom', False)
 
-        self.redraw_current_slide()
+        self.redraw_zoom()
         self.clear_cache()
         self.apply_zoom_to_medias()
 
         return True
+
+
+    def redraw_zoom(self):
+        """ Redraw the current slides and the selection over the videos.
+        """
+        self.redraw_current_slide()
+        self.selection_da.queue_draw()
 
 
     def apply_zoom_to_medias(self):
@@ -667,7 +687,7 @@ class Zoom(object):
         if self.zoom_selecting and self.zoom_points:
             self.zoom_points[1] = self.get_slide_point(widget, event)
 
-            self.redraw_current_slide()
+            self.redraw_zoom()
             return True
 
         return False
@@ -727,7 +747,7 @@ class Zoom(object):
             self.zoom_selecting = False
             self.set_media_pass_through(False)
             self.clear_cache()
-            self.redraw_current_slide()
+            self.redraw_zoom()
             self.apply_zoom_to_medias()
             self.set_action_enabled('unzoom', True)
 
@@ -764,6 +784,17 @@ class Zoom(object):
             Gdk.cairo_rectangle(cairo_context, rect)
             cairo_context.set_source_rgba(.5, .5, 1, .2)
             cairo_context.fill()
+
+
+    def draw_selection_overlay(self, widget, cairo_context):
+        """ Draw the zoom selection over the media overlays, like it is drawn on the slide.
+
+        Args:
+            widget (:class:`~Gtk.DrawingArea`): The transparent widget above the media overlays.
+            cairo_context (:class:`~cairo.Context`): The canvas on which to render the selection
+        """
+        cairo_context.transform(self.get_matrix(widget.get_allocated_width(), widget.get_allocated_height()))
+        self.draw_zoom_target(widget, cairo_context)
 
 
     def nop(*args, **kwargs):
