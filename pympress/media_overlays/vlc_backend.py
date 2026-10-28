@@ -109,6 +109,11 @@ class VlcOverlay(base.VideoOverlay):
         if not self.media_type.startswith('audio'):
             self.movie_zone.connect('draw', self.paint_backdrop)
 
+        if self.audio_meter is not None:
+            # VLC does not report audio levels: nothing would fill the meter, and its trough is drawn black over VLC
+            self.audio_meter.set_no_show_all(True)
+            self.audio_meter.set_visible(False)
+
         event_manager = self.player.event_manager()
         event_manager.event_attach(vlc.EventType.MediaPlayerEndReached, lambda e: GLib.idle_add(self.handle_end))
         # VLC calls these handlers from its own threads: anything touching GTK goes through GLib.idle_add
