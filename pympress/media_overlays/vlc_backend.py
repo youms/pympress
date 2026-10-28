@@ -169,7 +169,12 @@ class VlcOverlay(base.VideoOverlay):
         Args:
             filepath (`pathlib.Path`): The path to the media file path
         """
-        self.player.set_media(self._instance.media_new(filepath.resolve().as_uri()))
+        media = self._instance.media_new(filepath.resolve().as_uri())
+        if self.end_action == 'loop' and not self.repeat:
+            # VLC repeats the input itself: restarting the player at its end closes and reopens the video output,
+            # which shows black between two loops
+            media.add_option(':input-repeat=65535')
+        self.player.set_media(media)
 
 
     def handle_end(self):
@@ -179,6 +184,9 @@ class VlcOverlay(base.VideoOverlay):
         """
         if self.repeat:
             self.action_map.lookup_action('play').activate()
+        elif self.end_action == 'freeze':
+            # VLC keeps showing the last frame until the player is stopped (when the slide changes)
+            pass
         else:
             self.action_map.lookup_action('stop').activate()
 

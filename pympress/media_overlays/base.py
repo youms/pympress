@@ -51,6 +51,9 @@ class VideoOverlay(builder.Builder):
     """
     #: :class:`~Gtk.Overlay` that is the parent of the VideoOverlay widget.
     parent = None
+    #: `str` what a video does at its end when the PDF does not ask it to repeat: 'hide', 'freeze' or 'loop'
+    #: (`video_end` in the `media` section of the configuration)
+    end_action = 'hide'
     #: :class:`~Gtk.VBox` that contains all the elements to be overlaid.
     media_overlay = None
     #: A :class:`~Gtk.HBox` containing a toolbar with buttons and :attr:`~progress` the progress bar
@@ -173,12 +176,18 @@ class VideoOverlay(builder.Builder):
 
 
     def handle_end(self):
-        """ End of the stream reached: restart if looping, otherwise hide overlay
+        """ End of the stream reached.
+
+        Restart if looping, otherwise follow the `video_end` setting: hide the overlay, keep the last frame on screen,
+        or loop.
         """
-        if not self.repeat:
-            self.action_map.lookup_action('stop').activate()
-        else:
+        if self.repeat or self.end_action == 'loop':
             self.action_map.lookup_action('set_time').activate(GLib.Variant.new_double(self.start_pos))
+        elif self.end_action == 'freeze':
+            # leave the player at its end: the video output keeps showing the last frame until the slide changes
+            pass
+        else:
+            self.action_map.lookup_action('stop').activate()
 
 
     def update_margins_for_page(self, page_type):
