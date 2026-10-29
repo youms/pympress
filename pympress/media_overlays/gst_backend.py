@@ -167,6 +167,7 @@ class GstOverlay(base.VideoOverlay):
         Returns:
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
+        self.restart_if_ended()
         self.playbin.set_state(Gst.State.PLAYING)
 
         return False
@@ -180,7 +181,10 @@ class GstOverlay(base.VideoOverlay):
         Returns:
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
-        self.playbin.set_state(Gst.State.PLAYING if not self.is_playing() else Gst.State.PAUSED)
+        if self.restart_if_ended():
+            self.playbin.set_state(Gst.State.PLAYING)
+        else:
+            self.playbin.set_state(Gst.State.PLAYING if not self.is_playing() else Gst.State.PAUSED)
 
         return False
 
@@ -207,6 +211,7 @@ class GstOverlay(base.VideoOverlay):
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
         self.last_timestamp = time
+        self.ended = False
         self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, time * Gst.SECOND)
         return False
 
