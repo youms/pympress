@@ -54,6 +54,8 @@ class VideoOverlay(builder.Builder):
     #: `str` what a video does at its end when the PDF does not ask it to repeat: 'hide', 'freeze' or 'loop'
     #: (`video_end` in the `media` section of the configuration)
     end_action = 'hide'
+    #: `bool` whether the video reached its end and was left there (`video_end = freeze`): playing it again restarts it
+    ended = False
     #: :class:`~Gtk.VBox` that contains all the elements to be overlaid.
     media_overlay = None
     #: A :class:`~Gtk.HBox` containing a toolbar with buttons and :attr:`~progress` the progress bar
@@ -322,8 +324,9 @@ class VideoOverlay(builder.Builder):
         if self.repeat or self.end_action == 'loop':
             self.action_map.lookup_action('set_time').activate(GLib.Variant.new_double(self.start_pos))
         elif self.end_action == 'freeze':
-            # leave the player at its end: the video output keeps showing the last frame until the slide changes
-            pass
+            # leave the player at its end: the video output keeps showing the last frame until the slide changes, or
+            # until it is played again
+            self.ended = True
         else:
             self.action_map.lookup_action('stop').activate()
 
@@ -486,6 +489,20 @@ class VideoOverlay(builder.Builder):
         raise NotImplementedError
 
 
+    def restart_if_ended(self):
+        """ Put a video that was left at its end back at its start, ready to play again.
+
+        Returns:
+            `bool`: `True` iff the video had ended
+        """
+        if not self.ended:
+            return False
+
+        self.ended = False
+        self.do_set_time(self.start_pos)
+        return True
+
+
     def _set_file(self, filepath):
         """ Sets the media file to be played by the widget.
 
@@ -520,6 +537,7 @@ class VideoOverlay(builder.Builder):
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
         self._stop_pointer_poll()
+        self.ended = False
         self.do_stop()
         self.media_overlay.hide()
 

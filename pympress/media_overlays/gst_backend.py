@@ -837,10 +837,13 @@ class GstOverlay(base.VideoOverlay):
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
         self.is_frozen = False
+        replay = self.restart_if_ended()
         self.update_gpu_target()
         if self.use_d3d9_sink and not self.is_playing() and not self.prepare_d3d9_play():
             return False
         self.playbin.set_state(Gst.State.PLAYING)
+        if replay:
+            self.start_frame_tick()
 
         return False
 
@@ -854,11 +857,12 @@ class GstOverlay(base.VideoOverlay):
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
         self.is_frozen = False
+        replay = self.restart_if_ended()
         self.update_gpu_target()
         if (self.use_d3d9_sink and not self.is_playing() and self.playbin.get_state(0)[1] != Gst.State.PAUSED and
                 not self.prepare_d3d9_play()):
             return False
-        new_state = Gst.State.PLAYING if not self.is_playing() else Gst.State.PAUSED
+        new_state = Gst.State.PLAYING if replay or not self.is_playing() else Gst.State.PAUSED
         if new_state == Gst.State.PAUSED:
             GLib.idle_add(self.update_audio_meter, 0.0)
         self.playbin.set_state(new_state)
@@ -898,6 +902,7 @@ class GstOverlay(base.VideoOverlay):
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
         self.last_timestamp = time
+        self.ended = False
         self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, time * Gst.SECOND)
         return False
 

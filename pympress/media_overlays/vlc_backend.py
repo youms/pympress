@@ -274,6 +274,9 @@ class VlcOverlay(base.VideoOverlay):
         if play_from_state in {vlc.State.Ended, vlc.State.Playing}:
             self.player.stop()
             play_from_state = vlc.State.Stopped
+            self.ended = False
+        else:
+            self.restart_if_ended()
 
         if self._reveal_pending:
             # GTK can map the zone again after handle_embed: hide it before VLC creates its video window
@@ -322,6 +325,9 @@ class VlcOverlay(base.VideoOverlay):
         Returns:
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
+        if self.ended:
+            return self.do_play()
+
         self.player.pause() if self.player.is_playing() else self.player.play()
         return False
 
@@ -620,6 +626,7 @@ class VlcOverlay(base.VideoOverlay):
         """
         # Update last_timestamp first, as seeking should bypass auto stop after duration
         self.last_timestamp = time
+        self.ended = False
         self.player.set_time(int(round(time * 1000.)))
         return False
 
