@@ -332,6 +332,17 @@ class VlcOverlay(base.VideoOverlay):
         return False
 
 
+    def do_pause(self):
+        """ Pauses the media, keeping its current frame on screen.
+
+        Returns:
+            `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
+        """
+        if self.player.is_playing() and not self.ended:
+            self.player.set_pause(1)
+        return False
+
+
     def do_hide(self, *args):
         """ Remove widget from overlays. Needs to be called via :func:`~GLib.idle_add`.
 

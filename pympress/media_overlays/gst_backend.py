@@ -871,6 +871,20 @@ class GstOverlay(base.VideoOverlay):
         return False
 
 
+    def do_pause(self):
+        """ Pauses the media, keeping its current frame on screen.
+
+        Returns:
+            `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
+        """
+        ret, state, pending = self.playbin.get_state(0)
+        if (state == Gst.State.PLAYING or pending == Gst.State.PLAYING) and not self.ended:
+            GLib.idle_add(self.update_audio_meter, 0.0)
+            self.playbin.set_state(Gst.State.PAUSED)
+
+        return False
+
+
     def do_stop(self):
         """ Stops playing in the backend player.
         """

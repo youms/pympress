@@ -489,6 +489,17 @@ class VideoOverlay(builder.Builder):
         raise NotImplementedError
 
 
+    def do_pause(self):
+        """ Pauses the media, keeping its current frame on screen. Does nothing if it is not playing.
+
+        Should run on the main thread to ensure we avoid reentrency problems.
+
+        Returns:
+            `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
+        """
+        raise NotImplementedError
+
+
     def restart_if_ended(self):
         """ Put a video that was left at its end back at its start, ready to play again.
 
