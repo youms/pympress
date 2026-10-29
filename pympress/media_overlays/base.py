@@ -60,6 +60,14 @@ class VideoOverlay(builder.Builder):
     toolbar = None
     #: :class:`~Gtk.LevelBar` live audio level bar on the video overlay.
     audio_meter = None
+    #: `float` opacity of the audio level bar once it has faded out in silence
+    audio_meter_idle_opacity = .15
+    #: `float` time in s of silence after which the audio level bar fades out
+    audio_meter_hold = 1.
+    #: `float` normalized level (0 to 1) at or below which the audio is considered silent
+    audio_meter_silence = .02
+    #: `int` interval in ms between two steps of the audio level bar's fade-out
+    audio_meter_fade_interval = 50
     #: :class:`~VideoOverlay` partner overlay for the other window (presenter <-> content).
     partner = None
     #: :class:`~Gtk.Scale` that is the progress bar in the controls toolbar - if we have one.
@@ -120,6 +128,11 @@ class VideoOverlay(builder.Builder):
             self.audio_meter.set_visible(media.show_controls)
             if isinstance(self.media_overlay, Gtk.Overlay):
                 self.media_overlay.connect('size-allocate', self._on_overlay_size_allocate)
+
+        self._meter_last_sound = 0
+        self._meter_fade = None
+        if self.audio_meter is not None:
+            self.audio_meter.set_opacity(self.audio_meter_idle_opacity)
 
         self._floating_controls = media.show_controls and isinstance(self.media_overlay, Gtk.Overlay)
         self._pointer_poll = None
@@ -246,16 +259,48 @@ class VideoOverlay(builder.Builder):
 
 
     def update_audio_meter(self, level):
-        """ Update audio level bar value.
+        """ Update audio level bar value, and make it opaque while there is sound.
+
+        In silence the bar fades to :attr:`audio_meter_idle_opacity` after :attr:`audio_meter_hold` seconds, so that it
+        stays visible as a hint that the audio is on, without cluttering the video.
 
         Args:
             level (float): Normalized audio level between 0.0 and 1.0
         """
-        if self.audio_meter is not None:
-            self.audio_meter.set_value(max(0.0, min(1.0, level)))
-        if self.partner is not None and getattr(self.partner, 'audio_meter', None) is not None:
-            self.partner.audio_meter.set_value(max(0.0, min(1.0, level)))
+        level = max(0.0, min(1.0, level))
+        meters = [m for m in (self.audio_meter, getattr(self.partner, 'audio_meter', None)) if m is not None]
+        for meter in meters:
+            meter.set_value(level)
+
+        if level > self.audio_meter_silence:
+            self._meter_last_sound = GLib.get_monotonic_time()
+            for meter in meters:
+                meter.set_opacity(min(1., meter.get_opacity() + .5))
+
+        if self._meter_fade is None and meters and meters[0].get_opacity() > self.audio_meter_idle_opacity:
+            self._meter_fade = GLib.timeout_add(self.audio_meter_fade_interval, self._fade_audio_meter)
         return False
+
+
+    def _fade_audio_meter(self):
+        """ Fade the audio level bar out once it has been silent for :attr:`audio_meter_hold` seconds.
+
+        Returns:
+            `bool`: `True` to keep fading (:func:`~GLib.timeout_add` convention)
+        """
+        meters = [m for m in (self.audio_meter, getattr(self.partner, 'audio_meter', None)) if m is not None]
+        if (GLib.get_monotonic_time() - self._meter_last_sound) / 1e6 < self.audio_meter_hold:
+            return True
+
+        faded = True
+        for meter in meters:
+            opacity = max(self.audio_meter_idle_opacity, meter.get_opacity() - .05)
+            meter.set_opacity(opacity)
+            faded = faded and opacity <= self.audio_meter_idle_opacity
+
+        if faded:
+            self._meter_fade = None
+        return not faded
 
 
     def handle_embed(self, mapped_widget):
