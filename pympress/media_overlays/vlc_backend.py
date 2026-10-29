@@ -76,6 +76,8 @@ UNFREEZE_DELAY_MS = 150
 REVEAL_TIMEOUT_MS = 1500
 #: Delay (ms) between hiding the movie zone and stopping the player and removing the overlay
 REMOVE_DELAY_MS = 150
+#: How close (ms) to the end of the video a paused player must be, to count as having ended
+PAUSED_AT_END_MS = 300
 
 
 class VlcOverlay(base.VideoOverlay):
@@ -276,6 +278,7 @@ class VlcOverlay(base.VideoOverlay):
             play_from_state = vlc.State.Stopped
             self.ended = False
         else:
+            self.ended = self.ended or self.is_paused_at_end()
             self.restart_if_ended()
 
         if self._reveal_pending:
@@ -325,11 +328,24 @@ class VlcOverlay(base.VideoOverlay):
         Returns:
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
-        if self.ended:
+        if self.ended or self.is_paused_at_end():
             return self.do_play()
 
         self.player.pause() if self.player.is_playing() else self.player.play()
         return False
+
+
+    def is_paused_at_end(self):
+        """ Returns whether the player sits on the last frame of the video, where `:play-and-pause` leaves it.
+
+        VLC sends no end event then, as the input is paused instead of ending.
+
+        Returns:
+            `bool`: `True` iff the player is paused within a fraction of a second of the end of the video.
+        """
+        length = self.player.get_length()
+        return (self.end_action == 'freeze' and self.player.get_state() == vlc.State.Paused and length > 0 and
+                self.player.get_time() >= min(length, self.end_pos * 1000.) - PAUSED_AT_END_MS)
 
 
     def do_pause(self):
