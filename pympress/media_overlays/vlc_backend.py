@@ -431,6 +431,9 @@ class VlcOverlay(base.VideoOverlay):
     _still = None
     _still_area = None
     _freeze_gen = 0
+    #: `~cairo.Surface` of the still picture scaled to the size it is drawn at, and that size in widget pixels
+    _still_surface = None
+    _still_size = None
 
     def set_pass_through(self, pass_through):
         """ While the zoom area is selected, show a still picture instead of VLC's window.
@@ -494,6 +497,9 @@ class VlcOverlay(base.VideoOverlay):
         try:
             if gen == self._freeze_gen and self.pass_through and self.is_shown():
                 self._still = GdkPixbuf.Pixbuf.new_from_file(path)
+                # Scale the picture now, while VLC's window still covers its place. Scaling it while drawing takes
+                # tens of ms, during which the shrunk window has uncovered an area that is not painted yet.
+                self.scale_still(self.media_overlay.get_allocated_width(), self.media_overlay.get_allocated_height())
                 if self._still_area is None:
                     self._still_area = Gtk.DrawingArea()
                     self._still_area.set_halign(Gtk.Align.FILL)
@@ -524,6 +530,19 @@ class VlcOverlay(base.VideoOverlay):
         return False
 
 
+    def scale_still(self, width, height):
+        """ Scale the still picture to the size it is drawn at, so that drawing it is a plain copy.
+
+        Args:
+            width (`int`): the width of the area the picture is drawn in, in widget pixels
+            height (`int`): the height of that area
+        """
+        scale = self.media_overlay.get_scale_factor()
+        scaled = self._still.scale_simple(max(1, width * scale), max(1, height * scale), GdkPixbuf.InterpType.BILINEAR)
+        self._still_surface = Gdk.cairo_surface_create_from_pixbuf(scaled, scale, None)
+        self._still_size = (width, height)
+
+
     def unfreeze(self, gen):
         """ Show VLC's window again instead of the still picture. Runs on the main thread.
 
@@ -536,6 +555,7 @@ class VlcOverlay(base.VideoOverlay):
         if gen == self._freeze_gen and self._frozen:
             self._frozen = False
             self._still = None
+            self._still_surface = None
             self.parent.remove(self._still_area)
             self._still_area = None
             self.resize()
@@ -551,9 +571,10 @@ class VlcOverlay(base.VideoOverlay):
         """
         if self._still is None:
             return
-        context.scale(widget.get_allocated_width() / self._still.get_width(),
-                      widget.get_allocated_height() / self._still.get_height())
-        Gdk.cairo_set_source_pixbuf(context, self._still, 0, 0)
+        width, height = widget.get_allocated_width(), widget.get_allocated_height()
+        if self._still_size != (width, height):
+            self.scale_still(width, height)  # the area was resized since the picture was scaled
+        context.set_source_surface(self._still_surface, 0, 0)
         context.paint()
 
 
