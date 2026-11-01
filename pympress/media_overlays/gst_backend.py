@@ -25,6 +25,8 @@
 
 import logging
 import os
+import sys
+import pathlib
 import ctypes
 logger = logging.getLogger(__name__)
 
@@ -928,6 +930,16 @@ class GstOverlay(base.VideoOverlay):
         Returns:
             `str`: the version of Gst used by the backend
         """
+        if getattr(sys, 'frozen', False):
+            # Frozen packages bring their own plugins, and must not pick up another install's
+            plugins = pathlib.Path(sys.executable).parent.joinpath('lib', 'gstreamer-1.0')
+            os.environ['GST_PLUGIN_PATH'] = str(plugins)
+            os.environ['GST_PLUGIN_SYSTEM_PATH'] = ''
+
+            cache_dir = pathlib.Path(GLib.get_user_cache_dir(), 'pympress')
+            cache_dir.mkdir(parents = True, exist_ok = True)
+            os.environ['GST_REGISTRY'] = str(cache_dir.joinpath('gstreamer-registry.bin'))
+
         Gst.init(gst_opts)
 
         if Gst.ElementFactory.make('gtksink', None) is None:

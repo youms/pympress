@@ -155,8 +155,8 @@ def dlls():
     libidn2-0.dll libjpeg-8.dll liblcms2-2.dll libnghttp2-14.dll libnspr4.dll libopenjp2-7.dll \
     libpango-1.0-0.dll libpangocairo-1.0-0.dll libpangoft2-1.0-0.dll libpangowin32-1.0-0.dll \
     libplc4.dll libplds4.dll libpoppler-105.dll libpoppler-cpp-0.dll libpoppler-glib-8.dll libpsl-5.dll \
-    libpython{0.major}.{0.minor}.dll libstdc++-6.dll libthai-0.dll libtiff-5.dll libunistring-2.dll \
-    libwinpthread-1.dll libzstd.dll nss3.dll nssutil3.dll smime3.dll'.format(sys.version_info)
+    libstdc++-6.dll libthai-0.dll libtiff-5.dll libunistring-2.dll libzstd.dll nss3.dll nssutil3.dll smime3.dll'
+    # libpython and libwinpthread are what the executables link to: cx_Freeze puts them next to the executables
     # these appear superfluous, though unexpectedly so:
     # libcairo-2.dll libcairo-gobject-2.dll libfontconfig-1.dll libfreetype-6.dll libiconv-2.dll
     # libgettextlib-0-19-8-1.dll libgettextpo-0.dll libgettextsrc-0-19-8-1.dll libintl-8.dll libjasper-4.dll
@@ -169,15 +169,41 @@ def dlls():
         path = find_library(lib)
         path = pathlib.Path(path) if path is not None else path
         if path is not None and path.exists():
-            include_files.append((str(path), lib))
+            include_files.append((str(path), str(pathlib.Path('lib', lib))))
         else:
             lib = pathlib.Path(lib)
             # Look in other directories?
             for path in lib_gtk_dir.glob(re.sub('-[0-9.]*$', '-*', lib.stem) + lib.suffix):
-                include_files.append((str(path), path.name))
+                include_files.append((str(path), str(pathlib.Path('lib', path.name))))
                 print('WARNING: Can not find library {}, including {} instead'.format(lib, path.name))
             else:
                 print('WARNING: Can not find library {}'.format(lib))
+
+    return include_files
+
+
+def gstreamer_plugins():
+    """ Returns the GStreamer plugins needed to play videos, in a frozen/binary package on windows.
+
+    The plugins go in `lib/gstreamer-1.0`, where :func:`pympress.media_overlays.gst_backend.GstOverlay.setup_backend`
+    looks for them when frozen. cx_Freeze finds the DLLs they depend on and includes them with the other libraries.
+    """
+    if os.name != 'nt':
+        return []
+
+    plugins = 'app audioconvert audioparsers audioresample autodetect coreelements d3d d3d11 directsound gtk \
+    isomp4 level libav matroska playback typefindfunctions videocrop videofilter videoconvertscale \
+    videoparsersbad volume wasapi2'.split()
+
+    plugin_dir = pathlib.Path(find_library('libgtk-3-0')).parent.parent.joinpath('lib', 'gstreamer-1.0')
+
+    include_files = []
+    for plugin in plugins:
+        path = plugin_dir.joinpath('libgst{}.dll'.format(plugin))
+        if path.exists():
+            include_files.append((str(path), str(pathlib.Path('lib', 'gstreamer-1.0', path.name))))
+        else:
+            print('WARNING: Can not find GStreamer plugin {} (at {})'.format(plugin, path))
 
     return include_files
 
@@ -231,6 +257,7 @@ if __name__ == '__main__':
     if check_cli_arg('--freeze'):
         print('Using cx_Freeze.setup():', file=sys.stderr)
         from cx_Freeze import setup, Executable
+
         from cx_Freeze.command.bdist_msi import bdist_msi
 
         class BdistMsiOpenWith(bdist_msi):
@@ -267,7 +294,7 @@ if __name__ == '__main__':
                     'includes': [],
                     'excludes': ['tkinter'],
                     'packages': ['codecs', 'gi', 'vlc', 'watchdog'],
-                    'include_files': gtk_resources() + dlls() + pympress_resources(),
+                    'include_files': gtk_resources() + dlls() + pympress_resources() + gstreamer_plugins(),
                     'silent': True
                 },
                 'bdist_msi': {
@@ -278,13 +305,14 @@ if __name__ == '__main__':
                         'keywords': 'pdf-viewer, beamer, presenter, slide, projector, pdf-reader, \
                                     presentation, python, poppler, gtk, pygi, vlc',
                     },
-                    'upgrade_code': '{5D156784-ED69-49FF-A972-CBAD312187F7}',
+                    'product_name': 'pympress-fixes',
+                    'upgrade_code': '{BF85FFE8-29CF-478B-A933-4E6A17C8975E}',
                     'install_icon': str(pathlib.Path('pympress', 'share', 'pixmaps', 'pympress.ico')),
                 }
             },
             'executables': [
                 Executable(str(pathlib.Path('pympress', '__main__.py')), target_name='pympress-gui.exe',
-                           base='gui', shortcut_dir='ProgramMenuFolder', shortcut_name='pympress',
+                           base='gui', shortcut_dir='ProgramMenuFolder', shortcut_name='pympress-fixes',
                            icon=str(pathlib.Path('pympress', 'share', 'pixmaps', 'pympress.ico'))),
                 Executable(str(pathlib.Path('pympress', '__main__.py')), target_name='pympress.exe',
                            base='console', icon=str(pathlib.Path('pympress', 'share', 'pixmaps', 'pympress.ico'))),
