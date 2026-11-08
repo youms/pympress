@@ -39,6 +39,7 @@ from gi.repository import GLib, Gst, GstVideo, Gtk  # noqa: E402
 
 
 from pympress import util
+import cairo
 from pympress.media_overlays import base
 
 
@@ -107,11 +108,69 @@ def win32():
     if not user32.RegisterClassExW(ctypes.byref(wc)):
         logger.warning('GStreamer: video popup window class not registered')
 
+    gdi32 = ctypes.WinDLL('gdi32')
+    user32.UpdateLayeredWindow.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint
+    ]
+    user32.UpdateLayeredWindow.restype = wintypes.BOOL
+
+    gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+    gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    gdi32.DeleteDC.restype = wintypes.BOOL
+    gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+    gdi32.SelectObject.restype = ctypes.c_void_p
+    gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.DeleteObject.restype = wintypes.BOOL
+    gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    gdi32.CreateDIBSection.restype = ctypes.c_void_p
+    gdi32.CreateDIBSection.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint
+    ]
+
     gdk = ctypes.CDLL('libgdk-3-0.dll')
     gdk.gdk_win32_window_get_handle.restype = ctypes.c_void_p
     gdk.gdk_win32_window_get_handle.argtypes = [ctypes.c_void_p]
-    _win32 = (user32, kernel32, gdk)
+    _win32 = (user32, kernel32, gdk, gdi32)
     return _win32
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
+
+class SIZE(ctypes.Structure):
+    _fields_ = [('cx', ctypes.c_long), ('cy', ctypes.c_long)]
+
+
+class BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [
+        ('BlendOp', ctypes.c_ubyte),
+        ('BlendFlags', ctypes.c_ubyte),
+        ('SourceConstantAlpha', ctypes.c_ubyte),
+        ('AlphaFormat', ctypes.c_ubyte)
+    ]
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ('biSize', ctypes.c_uint),
+        ('biWidth', ctypes.c_long),
+        ('biHeight', ctypes.c_long),
+        ('biPlanes', ctypes.c_ushort),
+        ('biBitCount', ctypes.c_ushort),
+        ('biCompression', ctypes.c_uint),
+        ('biSizeImage', ctypes.c_uint),
+        ('biXPelsPerMeter', ctypes.c_long),
+        ('biYPelsPerMeter', ctypes.c_long),
+        ('biClrUsed', ctypes.c_uint),
+        ('biClrImportant', ctypes.c_uint)
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [('bmiHeader', BITMAPINFOHEADER), ('bmiColors', ctypes.c_uint * 3)]
 
 
 class D3D12OverlayPlayer(object):
@@ -136,8 +195,9 @@ class D3D12OverlayPlayer(object):
         return cls._instance
 
     def __init__(self):
-        user32, kernel32, gdk = win32()
+        user32, kernel32, gdk, gdi32 = win32()
         self.user32 = user32
+        self.gdi32 = gdi32
 
         # Create persistent GStreamer playbin and d3d12videosink
         self.playbin = Gst.ElementFactory.make('playbin', 'pympress_d3d12_playbin')
@@ -169,6 +229,12 @@ class D3D12OverlayPlayer(object):
         self.popup = None
         self.popup_owner = None
         self.active_overlay = None
+        self.selection_popup = None
+        self.sel_dib = None
+        self.sel_dc = None
+        self.sel_bits = None
+        self.sel_old_bm = None
+        self.sel_size = (0, 0)
 
         # GStreamer bus listeners
         bus = self.playbin.get_bus()
@@ -288,6 +354,115 @@ class D3D12OverlayPlayer(object):
             seek_pos = min(seek_pos, max(0, dur - 5 * Gst.MSECOND))
         self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE, seek_pos)
 
+    def hide_selection_popup(self):
+        """ Hide the native layered selection popup window. """
+        if self.selection_popup and self.user32.IsWindow(self.selection_popup):
+            self.user32.ShowWindow(self.selection_popup, 0)
+
+    def ensure_selection_popup(self, owner, vx, vy, vw, vh):
+        """ Ensure the native layered selection popup exists and matches geometry. """
+        if self.selection_popup is not None and (owner != self.popup_owner or not self.user32.IsWindow(self.selection_popup)):
+            self.user32.DestroyWindow(self.selection_popup)
+            self.selection_popup = None
+
+        if self.selection_popup is None:
+            ex_style = 0x08000000 | 0x80 | 0x20 | 0x00080000
+            style = 0x80000000
+            self.selection_popup = self.user32.CreateWindowExW(
+                ex_style, D3D12_POPUP_CLASS, None, style,
+                vx, vy, vw, vh, owner, None, None, None
+            )
+
+        if (vw, vh) != self.sel_size:
+            if self.sel_dib:
+                self.gdi32.SelectObject(self.sel_dc, self.sel_old_bm)
+                self.gdi32.DeleteObject(self.sel_dib)
+                self.gdi32.DeleteDC(self.sel_dc)
+                self.sel_dib = None
+                self.sel_dc = None
+                self.sel_bits = None
+
+            bmi = BITMAPINFO()
+            bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.bmiHeader.biWidth = vw
+            bmi.bmiHeader.biHeight = -vh
+            bmi.bmiHeader.biPlanes = 1
+            bmi.bmiHeader.biBitCount = 32
+            bmi.bmiHeader.biCompression = 0
+
+            self.sel_dc = self.gdi32.CreateCompatibleDC(None)
+            bits = ctypes.c_void_p()
+            self.sel_dib = self.gdi32.CreateDIBSection(
+                self.sel_dc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0
+            )
+            self.sel_old_bm = self.gdi32.SelectObject(self.sel_dc, self.sel_dib)
+            self.sel_bits = bits
+            self.sel_size = (vw, vh)
+
+        return bool(self.selection_popup and self.sel_dib)
+
+    def update_zoom_selection(self, overlay, zoom_points, scale, shift):
+        """ Render the zoom selection rectangle onto the native layered selection popup. """
+        if not zoom_points or self.active_overlay != overlay or not self.popup:
+            self.hide_selection_popup()
+            return
+
+        geom = overlay.popup_geometry()
+        if not geom:
+            self.hide_selection_popup()
+            return
+        owner, vx, vy, vw, vh = geom
+        if vw < 16 or vh < 16:
+            self.hide_selection_popup()
+            return
+
+        if not self.ensure_selection_popup(owner, vx, vy, vw, vh):
+            return
+
+        buf_len = vw * vh * 4
+        ctypes.memset(self.sel_bits, 0, buf_len)
+
+        buf = (ctypes.c_char * buf_len).from_address(self.sel_bits.value)
+        surface = cairo.ImageSurface.create_for_data(buf, cairo.Format.ARGB32, vw, vh, vw * 4)
+        ctx = cairo.Context(surface)
+
+        cw = overlay.parent.get_allocated_width()
+        ch = overlay.parent.get_allocated_height()
+        dpi_scale = overlay.parent.get_scale_factor()
+        mo = overlay.media_overlay
+        ml = mo.props.margin_left
+        mt = mo.props.margin_top
+
+        ctx.scale(dpi_scale, dpi_scale)
+        ctx.translate(-ml, -mt)
+        ctx.transform(cairo.Matrix(xx=scale, x0=cw * shift[0], yy=scale, y0=ch * shift[1]))
+
+        xmin, xmax = sorted(p[0] * cw for p in zoom_points)
+        ymin, ymax = sorted(p[1] * ch for p in zoom_points)
+
+        ctx.set_line_width(3)
+        ctx.set_line_cap(cairo.LINE_CAP_SQUARE)
+        ctx.rectangle(xmin, ymin, xmax - xmin, ymax - ymin)
+        ctx.set_source_rgba(0.1, 0.1, 1.0, 0.4)
+        ctx.stroke()
+
+        ctx.rectangle(xmin, ymin, xmax - xmin, ymax - ymin)
+        ctx.set_source_rgba(0.5, 0.5, 1.0, 0.2)
+        ctx.fill()
+        surface.flush()
+
+        pt_dst = POINT(vx, vy)
+        size = SIZE(vw, vh)
+        pt_src = POINT(0, 0)
+        blend = BLENDFUNCTION(0, 0, 255, 1)
+
+        self.user32.UpdateLayeredWindow(
+            self.selection_popup, None, ctypes.byref(pt_dst), ctypes.byref(size),
+            self.sel_dc, ctypes.byref(pt_src), 0, ctypes.byref(blend), 2
+        )
+        self.user32.SetWindowPos(self.selection_popup, 0, vx, vy, vw, vh, 0x0010)
+        self.user32.ShowWindow(self.selection_popup, 8)
+
     def ensure_popup(self, owner, x, y, w, h):
         """ Ensure the persistent popup HWND exists, is owned by toplevel, and matches geometry. """
         if self.popup is not None and (owner != self.popup_owner or not self.user32.IsWindow(self.popup)):
@@ -354,6 +529,7 @@ class D3D12OverlayPlayer(object):
         """ Hide the popup window and pause the persistent pipeline. """
         self.reveal_gen += 1
         self.reveal_pending = False
+        self.hide_selection_popup()
         if self.popup:
             self.user32.SetLayeredWindowAttributes(self.popup, 0, 0, 2)
             self.user32.ShowWindow(self.popup, 0)  # SW_HIDE = 0
@@ -392,6 +568,16 @@ class D3D12OverlayPlayer(object):
             self.pump_id = None
         if self.playbin:
             self.playbin.set_state(Gst.State.NULL)
+        self.hide_selection_popup()
+        if self.selection_popup:
+            self.user32.DestroyWindow(self.selection_popup)
+            self.selection_popup = None
+        if self.sel_dib:
+            self.gdi32.SelectObject(self.sel_dc, self.sel_old_bm)
+            self.gdi32.DeleteObject(self.sel_dib)
+            self.gdi32.DeleteDC(self.sel_dc)
+            self.sel_dib = None
+            self.sel_dc = None
         if self.popup:
             self.user32.DestroyWindow(self.popup)
             self.popup = None
@@ -611,6 +797,11 @@ class GstOverlay(base.VideoOverlay):
             for name, value in zip(names, values):
                 self.crop_filter.set_property(name, value)
         return new
+
+    def update_zoom_selection(self, zoom_points, scale, shift):
+        """ Update zoom selection rectangle on the Direct3D 12 popup. """
+        if self.use_d3d12_sink:
+            D3D12OverlayPlayer.get().update_zoom_selection(self, zoom_points, scale, shift)
 
     def apply_crop(self):
         """ Apply :attr:`crop_fractions` to `videocrop` and repaint a paused or frozen frame (main thread).
@@ -834,7 +1025,7 @@ class GstOverlay(base.VideoOverlay):
             (0, 0) if self.parent.get_has_window()
             else (self.parent.get_allocation().x, self.parent.get_allocation().y)
         )
-        user32, kernel32, gdk = win32()
+        user32, kernel32, gdk, _ = win32()
         owner = gdk.gdk_win32_window_get_handle(hash(top_window))
         scale = self.parent.get_scale_factor()
         point = (ctypes.c_long * 2)((x0 - tx + px + mo.props.margin_left) * scale,
