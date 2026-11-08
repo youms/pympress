@@ -25,7 +25,10 @@
 
 import logging
 import os
+import sys
+import pathlib
 import ctypes
+from ctypes import wintypes
 logger = logging.getLogger(__name__)
 
 import gi
@@ -39,20 +42,16 @@ from pympress import util
 from pympress.media_overlays import base
 
 
-#: Delay (ms) between the first frame reaching d3dvideosink and showing its window
-D3D9_REVEAL_DELAY_MS = 30
-#: Show the video window after this delay (ms) even if no frame arrived
-D3D9_REVEAL_TIMEOUT_MS = 1500
-#: Window class of the popups d3dvideosink draws into
-POPUP_CLASS = 'PympressVideoPopup'
+#: Window class of the persistent Direct3D 12 popups
+D3D12_POPUP_CLASS = 'PympressD3D12Popup'
 
 _win32 = None
 
 def win32():
-    """ user32 and gdk functions used for the video popups, with the popup window class registered (Windows only).
+    """ user32, kernel32, and gdk functions used for native Win32 video popups (Windows only).
 
     Returns:
-        `tuple`: (user32, gdk) :class:`~ctypes.CDLL` objects with argument types set
+        `tuple`: (user32, kernel32, gdk) :class:`~ctypes.CDLL` objects with argument types set
     """
     global _win32
     if _win32 is not None:
@@ -61,52 +60,253 @@ def win32():
     user32 = ctypes.WinDLL('user32')
     kernel32 = ctypes.WinDLL('kernel32')
     user32.CreateWindowExW.restype = ctypes.c_void_p
-    user32.CreateWindowExW.argtypes = [ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint,
-                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                       ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    user32.CreateWindowExW.argtypes = [
+        ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+    ]
     user32.DestroyWindow.argtypes = [ctypes.c_void_p]
     user32.IsWindow.argtypes = [ctypes.c_void_p]
     user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
-                                    ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint
+    ]
     user32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    user32.SetLayeredWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_ubyte, ctypes.c_uint]
     user32.RegisterClassExW.argtypes = [ctypes.c_void_p]
     user32.RegisterClassExW.restype = ctypes.c_ushort
+    user32.DefWindowProcW.restype = ctypes.c_longlong
+    user32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulonglong, ctypes.c_longlong]
+    user32.PeekMessageW.restype = wintypes.BOOL
+    user32.PeekMessageW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+    user32.TranslateMessage.argtypes = [ctypes.c_void_p]
+    user32.DispatchMessageW.argtypes = [ctypes.c_void_p]
+
     kernel32.GetModuleHandleW.restype = ctypes.c_void_p
     kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
 
     class WNDCLASSEXW(ctypes.Structure):
-        _fields_ = [('cbSize', ctypes.c_uint), ('style', ctypes.c_uint), ('lpfnWndProc', ctypes.c_void_p),
-                    ('cbClsExtra', ctypes.c_int), ('cbWndExtra', ctypes.c_int), ('hInstance', ctypes.c_void_p),
-                    ('hIcon', ctypes.c_void_p), ('hCursor', ctypes.c_void_p), ('hbrBackground', ctypes.c_void_p),
-                    ('lpszMenuName', ctypes.c_wchar_p), ('lpszClassName', ctypes.c_wchar_p),
-                    ('hIconSm', ctypes.c_void_p)]
+        _fields_ = [
+            ('cbSize', ctypes.c_uint), ('style', ctypes.c_uint), ('lpfnWndProc', ctypes.c_void_p),
+            ('cbClsExtra', ctypes.c_int), ('cbWndExtra', ctypes.c_int), ('hInstance', ctypes.c_void_p),
+            ('hIcon', ctypes.c_void_p), ('hCursor', ctypes.c_void_p), ('hbrBackground', ctypes.c_void_p),
+            ('lpszMenuName', ctypes.c_wchar_p), ('lpszClassName', ctypes.c_wchar_p),
+            ('hIconSm', ctypes.c_void_p)
+        ]
 
-    # No background brush and the default window procedure: nothing ever paints the popup (a STATIC control painted
-    # itself light grey when shown or uncovered, a white flash until the next video frame)
     wc = WNDCLASSEXW()
     wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
     wc.lpfnWndProc = ctypes.cast(user32.DefWindowProcW, ctypes.c_void_p).value
     wc.hInstance = kernel32.GetModuleHandleW(None)
-    wc.lpszClassName = POPUP_CLASS
+    wc.lpszClassName = D3D12_POPUP_CLASS
     if not user32.RegisterClassExW(ctypes.byref(wc)):
         logger.warning('GStreamer: video popup window class not registered')
 
     gdk = ctypes.CDLL('libgdk-3-0.dll')
     gdk.gdk_win32_window_get_handle.restype = ctypes.c_void_p
     gdk.gdk_win32_window_get_handle.argtypes = [ctypes.c_void_p]
-    _win32 = (user32, gdk)
+    _win32 = (user32, kernel32, gdk)
     return _win32
 
 
-class GstOverlay(base.VideoOverlay):
-    """ Simple Gstramer widget.
+class D3D12OverlayPlayer(object):
+    """ Persistent Direct3D 12 video player for the Content window on Windows.
 
-    Wraps a simple gstreamer playbin.
+    Recycles a single native Win32 popup window and a single GStreamer playbin pipeline with
+    d3d12videosink (direct-swapchain=True, external-window-only=True). Reusing the pipeline and
+    HWND across video slides eliminates swapchain churn, the 12,998-handle leak, and the Intel
+    driver teardown crash (igd10um64gen11.dll) while achieving sub-20ms slide transitions.
+    """
+    _instance = None
+
+    @classmethod
+    def get(cls):
+        """ Get or create the singleton persistent Direct3D 12 player instance.
+
+        Returns:
+            :class:`~D3D12OverlayPlayer`: the singleton player instance
+        """
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        user32, kernel32, gdk = win32()
+        self.user32 = user32
+
+        # Create persistent GStreamer playbin and d3d12videosink
+        self.playbin = Gst.ElementFactory.make('playbin', 'pympress_d3d12_playbin')
+        self.sink = Gst.ElementFactory.make('d3d12videosink', 'pympress_d3d12_sink')
+        self.sink.set_property('direct-swapchain', True)
+        self.sink.set_property('external-window-only', True)
+        self.sink.set_property('enable-navigation-events', False)
+
+        # Content window is muted in Pympress; presenter window plays audio
+        self.playbin.set_property('video-sink', self.sink)
+        self.playbin.set_property('audio-sink', Gst.ElementFactory.make('fakesink', 'd3d12_fake_audio'))
+
+        self.popup = None
+        self.popup_owner = None
+        self.active_overlay = None
+
+        # GStreamer bus listeners
+        bus = self.playbin.get_bus()
+        bus.enable_sync_message_emission()
+        bus.connect('sync-message', self.on_sync_message)
+        bus.add_signal_watch()
+        bus.connect('message::eos', self.on_bus_eos)
+        bus.connect('message::error', self.on_bus_error)
+        bus.connect('message::state-changed', self.on_bus_state_changed)
+        bus.connect('message::duration-changed', self.on_bus_duration_changed)
+
+        # Continuous Win32 message pump for DXGI presentation
+        self.msg_struct = wintypes.MSG()
+        self.pump_id = GLib.timeout_add(10, self.pump_messages)
+
+    def pump_messages(self):
+        """ Pump Win32 messages on Python's thread to keep DXGI swapchain presentation active. """
+        while self.user32.PeekMessageW(ctypes.byref(self.msg_struct), None, 0, 0, 1):
+            self.user32.TranslateMessage(ctypes.byref(self.msg_struct))
+            self.user32.DispatchMessageW(ctypes.byref(self.msg_struct))
+        return True
+
+    def on_sync_message(self, bus, msg):
+        """ Bind popup HWND synchronously when requested by playsink / videosink. """
+        if self.popup and GstVideo.is_video_overlay_prepare_window_handle_message(msg):
+            msg.src.set_window_handle(self.popup)
+            self.sink.set_window_handle(self.popup)
+
+    def on_bus_eos(self, *args):
+        """ Handle end-of-stream from the GStreamer bus on the main thread. """
+        if self.active_overlay:
+            GLib.idle_add(self.active_overlay.handle_end)
+
+    def on_bus_error(self, _, msg):
+        """ Log GStreamer bus errors. """
+        err, debug = msg.parse_error()
+        logger.error('D3D12 GStreamer Error: {} ({})'.format(err, debug))
+
+    def on_bus_state_changed(self, bus, msg):
+        """ Notify active overlay when transitioning to PAUSED. """
+        if msg.src == self.playbin and self.active_overlay:
+            old, new, pending = msg.parse_state_changed()
+            if old == Gst.State.READY and new == Gst.State.PAUSED:
+                self.active_overlay.on_initial_play()
+
+    def on_bus_duration_changed(self, *args):
+        """ Notify active overlay when duration becomes available. """
+        if self.active_overlay:
+            GLib.idle_add(self.active_overlay.do_update_duration)
+
+    def ensure_popup(self, owner, x, y, w, h):
+        """ Ensure the persistent popup HWND exists, is owned by toplevel, and matches geometry. """
+        if self.popup is not None and (owner != self.popup_owner or not self.user32.IsWindow(self.popup)):
+            self.user32.DestroyWindow(self.popup)
+            self.popup = None
+            self.popup_owner = None
+
+        if self.popup is None:
+            # WS_EX_NOACTIVATE (0x08000000) | WS_EX_TOOLWINDOW (0x80) | WS_EX_TRANSPARENT (0x20)
+            # WS_POPUP (0x80000000)
+            ex_style = 0x08000000 | 0x80 | 0x20
+            style = 0x80000000
+            self.popup = self.user32.CreateWindowExW(
+                ex_style, D3D12_POPUP_CLASS, None, style,
+                x, y, w, h, owner, None, None, None
+            )
+            self.popup_owner = owner
+            self.sink.set_window_handle(self.popup)
+        else:
+            # SWP_NOZORDER (0x0004) | SWP_NOACTIVATE (0x0010)
+            self.user32.SetWindowPos(self.popup, None, x, y, w, h, 0x0004 | 0x0010)
+
+        return bool(self.popup)
+
+    def play(self, overlay):
+        """ Switch to overlay's clip and start playback on the persistent D3D12 pipeline. """
+        geometry = overlay.popup_geometry()
+        if not geometry:
+            logger.warning('D3D12: cannot play, geometry not ready')
+            return False
+
+        owner, x, y, w, h = geometry
+        if not self.ensure_popup(owner, x, y, w, h):
+            return False
+
+        self.active_overlay = overlay
+        uri = overlay.file.as_uri()
+
+        # Update URI on persistent playbin
+        self.playbin.set_state(Gst.State.READY)
+        self.playbin.set_property('uri', uri)
+
+        # Show native HWND (SW_SHOWNA = 8)
+        self.user32.ShowWindow(self.popup, 8)
+        self.playbin.set_state(Gst.State.PLAYING)
+        return True
+
+    def pause(self):
+        """ Pause the persistent GStreamer playbin pipeline. """
+        self.playbin.set_state(Gst.State.PAUSED)
+
+    def resume(self):
+        """ Resume playback on the persistent GStreamer playbin pipeline. """
+        if self.popup:
+            self.user32.ShowWindow(self.popup, 8)
+        self.playbin.set_state(Gst.State.PLAYING)
+
+    def stop(self):
+        """ Hide the popup window and pause the persistent pipeline. """
+        if self.popup:
+            self.user32.ShowWindow(self.popup, 0)  # SW_HIDE = 0
+        self.playbin.set_state(Gst.State.PAUSED)
+
+    def seek(self, time_sec):
+        """ Seek the persistent pipeline to time `time_sec` in seconds. """
+        self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, time_sec * Gst.SECOND)
+
+    def is_playing(self, overlay):
+        """ Return whether the given overlay is currently playing on the pipeline. """
+        if self.active_overlay == overlay:
+            return self.playbin.get_state(0).state == Gst.State.PLAYING
+        return False
+
+    def query_position(self):
+        """ Query current playback position from the playbin pipeline. """
+        return self.playbin.query_position(Gst.Format.TIME)
+
+    def query_duration(self):
+        """ Query duration from the playbin pipeline. """
+        return self.playbin.query_duration(Gst.Format.TIME)
+
+    def update_geometry(self, overlay):
+        """ Update native popup window position and size to match the active overlay. """
+        if self.active_overlay == overlay and self.popup:
+            geom = overlay.popup_geometry()
+            if geom:
+                owner, x, y, w, h = geom
+                self.user32.SetWindowPos(self.popup, None, x, y, w, h, 0x0004 | 0x0010)
+
+    def shutdown(self):
+        """ Clean up the message pump timer, playbin pipeline, and native popup HWND. """
+        if self.pump_id:
+            GLib.source_remove(self.pump_id)
+            self.pump_id = None
+        if self.playbin:
+            self.playbin.set_state(Gst.State.NULL)
+        if self.popup:
+            self.user32.DestroyWindow(self.popup)
+            self.popup = None
+
+
+class GstOverlay(base.VideoOverlay):
+    """ Simple Gstreamer widget.
+
+    Wraps a GStreamer playbin pipeline with gtksink (preview/fallback) or a persistent Direct3D 12 overlay
+    (Content window on Windows).
     """
 
-    #: A :class:`~Gst.Playbin` to be play videos
+    #: A :class:`~Gst.Playbin` to play videos
     playbin = None
     #: A :class:`~Gst.Base.Sink` to display video content
     sink = None
@@ -131,47 +331,41 @@ class GstOverlay(base.VideoOverlay):
     #: whether playback has reached its end and is holding the last frame
     is_frozen = False
 
-    #: `bool` whether this overlay draws with d3dvideosink in a popup window (PYMPRESS_GSTSINK=d3d9, content window)
-    use_d3d9_sink = False
-    #: popup window handle that d3dvideosink draws into, above the slide
-    popup = None
-    #: native handle of the toplevel that owns :attr:`popup`
-    popup_owner = None
-    #: window handle last given to d3dvideosink
-    sink_hwnd = None
-    #: `bool` whether the popup waits for the first frame before being shown
-    reveal_pending = False
-    #: `int` incremented to cancel a scheduled reveal
-    reveal_gen = 0
+    #: `Gst.Element` the `videocrop` element that zooms into the video, or `None` if it is not available
+    crop_filter = None
+    #: `Gst.Element` the `capsfilter` after `videocrop` that keeps the frames at the size they had before the crop
+    crop_size_filter = None
+    #: `tuple` of `int` width and height of the frames that reach :attr:`crop_filter`, once known
+    crop_input_size = None
+
+    #: `Gst.Element` the `level` element that reports the audio levels shown by the meter, or `None`
+    audio_level_filter = None
+
+    #: `bool` whether this overlay uses the persistent Direct3D 12 player (Content window on Windows)
+    use_d3d12_sink = False
+    #: `pathlib.Path` path to the media file
+    file = None
 
     def __init__(self, *args, **kwargs):
-        # Create GStreamer playbin
-        self.playbin = Gst.ElementFactory.make('playbin', None)
-
-        # Windows, PYMPRESS_GSTSINK=d3d9: the content window's video is drawn by d3dvideosink (Direct3D 9) in a popup
-        # window owned by the content window and placed over the video area, so it is presented by the GPU off the GTK
-        # main thread. Direct3D 9 output inside a GTK window got blended with what is behind the window; in a separate
-        # popup it is shown as is. Only one d3dvideosink: all of them share one Direct3D 9 device and take turns at
-        # the refresh rate, so the presenter window's preview stays on gtksink.
         container = args[0] if args else kwargs.get('container')
-        self.use_d3d9_sink = (os.name == 'nt' and os.environ.get('PYMPRESS_GSTSINK', '').lower() == 'd3d9' and
-                              container is not None and Gtk.Buildable.get_name(container) == 'c_overlay' and
-                              Gst.ElementFactory.find('d3dvideosink') is not None)
-        if self.use_d3d9_sink:
-            self.sink = Gst.ElementFactory.make('d3dvideosink', None)
-            self.sink.set_property('enable-navigation-events', False)
-            # never open a window of its own: a stray window would show over the slides
-            self.sink.set_property('create-render-window', False)
-            self.sink.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.on_d3d9_buffer)
-            # never shown: the slide stays visible under the popup
+        self.use_d3d12_sink = (
+            os.name == 'nt' and
+            os.environ.get('PYMPRESS_GSTSINK', 'd3d12').lower() in ('d3d12', 'direct3d12') and
+            container is not None and Gtk.Buildable.get_name(container) == 'c_overlay' and
+            Gst.ElementFactory.find('d3d12videosink') is not None
+        )
+
+        if self.use_d3d12_sink:
             self.video_widget = Gtk.DrawingArea()
         else:
+            # Create GStreamer playbin for gtksink (Linux, Windows fallback, Presenter window preview)
+            self.playbin = Gst.ElementFactory.make('playbin', None)
             self.sink = Gst.ElementFactory.make('gtksink', None)
+            self.playbin.set_property('video-sink', self.sink)
+            self.setup_gpu_conversion()
+            self.setup_crop_filter()
+            self.setup_audio_filter()
             self.video_widget = self.sink.props.widget
-        self.playbin.set_property('video-sink', self.sink)
-        self.setup_gpu_conversion()
-        self.setup_crop_filter()
-        self.setup_audio_filter()
 
         super(GstOverlay, self).__init__(*args, **kwargs)
 
@@ -182,26 +376,28 @@ class GstOverlay(base.VideoOverlay):
             self.media_overlay.pack_start(self.video_widget, True, True, 0)
             self.media_overlay.reorder_child(self.video_widget, 0)
         self.video_widget.hide()
-        if self.use_d3d9_sink:
-            # follow the content window when it moves or changes size (e.g. fullscreen toggled)
-            self.parent.connect('size-allocate', lambda *args: self.place_popup())
-            # ... and when it moves without changing size (dragged as a window): size-allocate does not fire then, and
-            # the popup would stay at the old place, showing the video over whatever is there
+
+        if self.use_d3d12_sink:
+            # Reposition persistent D3D12 popup when parent changes allocation or moves
+            self.parent.connect('size-allocate', lambda *args: D3D12OverlayPlayer.get().update_geometry(self))
             toplevel = self.parent.get_toplevel()
             if toplevel is not None and toplevel.is_toplevel():
-                toplevel.connect('configure-event', self.on_toplevel_configure)
-
-        # Create bus to get events from GStreamer playin
-        bus = self.playbin.get_bus()
-        bus.add_signal_watch()
-        bus.enable_sync_message_emission()
-        bus.connect('message::eos', lambda *args: GLib.idle_add(self.handle_end))
-        bus.connect('message::error', lambda _, msg: logger.error('{} {}'.format(*msg.parse_error())))
-        bus.connect('message::state-changed', self.on_state_changed)
-        bus.connect('sync-message::element', self.on_sync_element)
-        bus.connect('message::element', self.on_element_message)
-        bus.connect('message::duration-changed', lambda *args: GLib.idle_add(self.do_update_duration))
-
+                toplevel.connect(
+                    'configure-event',
+                    lambda *args: GLib.idle_add(
+                        lambda: D3D12OverlayPlayer.get().update_geometry(self) and False
+                    ) and False
+                )
+        else:
+            # Create bus to get events from GStreamer playbin
+            bus = self.playbin.get_bus()
+            bus.add_signal_watch()
+            bus.enable_sync_message_emission()
+            bus.connect('message::eos', lambda *args: GLib.idle_add(self.handle_end))
+            bus.connect('message::error', lambda _, msg: logger.error('{} {}'.format(*msg.parse_error())))
+            bus.connect('message::state-changed', self.on_state_changed)
+            bus.connect('message::element', self.on_element_message)
+            bus.connect('message::duration-changed', lambda *args: GLib.idle_add(self.do_update_duration))
 
     def setup_gpu_conversion(self):
         """ Convert and scale the frames on the GPU (Direct3D 11) before they reach gtksink, if available.
@@ -232,40 +428,21 @@ class GstOverlay(base.VideoOverlay):
         self.gpu_size_filter = video_filter.get_by_name('gpusize')
         video_filter.get_by_name('gpuconvert').get_static_pad('sink').add_probe(
             Gst.PadProbeType.EVENT_DOWNSTREAM, self.on_gpu_convert_event)
-        if self.sink.find_property('widget') is not None:    # not every sink has a widget to follow
+        if self.sink.find_property('widget') is not None:
             self.sink.props.widget.connect('size-allocate', self.on_video_widget_allocated)
-        # The size is set when the caps reach d3d11convert, before it negotiates. While playing it only grows (see
-        # on_video_widget_allocated): gtksink can get stuck on the old size when the size shrinks mid-stream.
-
-
-    #: `Gst.Element` the `videocrop` element that zooms into the video, or `None` if it is not available
-    crop_filter = None
-    #: `Gst.Element` the `capsfilter` after `videocrop` that keeps the frames at the size they had before the crop
-    crop_size_filter = None
-    #: `tuple` of `int` width and height of the frames that reach :attr:`crop_filter`, once known
-    crop_input_size = None
 
     def setup_crop_filter(self):
         """ Add `videocrop` and a `videoscale` back to the original size to the video filter, to follow the zoom.
 
         `videocrop` works on frames in system memory. Without a GPU conversion bin the crop is the playbin's video
         filter, with one it goes after `d3d11download` in that bin, so that the crop is the same code on every platform.
-
-        The crop makes the frames smaller, and gtksink can get stuck on the old size when the size shrinks mid-stream
-        (see :meth:`on_video_widget_allocated`): it then draws nothing, with one critical message per frame. So the
-        frames are scaled back to the size they had, and the sink always gets the same size. `d3dvideosink` scales the
-        frames to its window on the GPU and has no such problem, so there the scaling is left out: doing it on the CPU
-        for every frame of a full screen video makes the video stall.
         """
         if any(Gst.ElementFactory.find(name) is None for name in ('videocrop', 'videoscale', 'capsfilter')):
             return
 
         crop = Gst.ElementFactory.make('videocrop', 'zoomcrop')
-        elements = [crop]
-        size = None
-        if not self.use_d3d9_sink:
-            size = Gst.ElementFactory.make('capsfilter', 'zoomsize')
-            elements += [Gst.ElementFactory.make('videoscale', 'zoomscale'), size]
+        size = Gst.ElementFactory.make('capsfilter', 'zoomsize')
+        elements = [crop, Gst.ElementFactory.make('videoscale', 'zoomscale'), size]
         video_filter = self.playbin.get_property('video-filter')
 
         if video_filter is None:
@@ -296,32 +473,25 @@ class GstOverlay(base.VideoOverlay):
         self.crop_size_filter = size
         crop.get_static_pad('sink').add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.on_crop_sink_event)
 
-
     def on_crop_sink_event(self, pad, info):
-        """ Follow the size of the frames that reach `videocrop`: the crop in pixels and the output size.
-
-        The crop is in pixels of the incoming frame, and `videocrop` stops the stream when it leaves nothing of a
-        frame, so both are set here, before the first frame of the new size gets through. Runs on the streaming
-        thread, so GTK calls are left to the main thread.
+        """ Record the size of the frames reaching videocrop and set its initial crop (streaming thread).
         """
         event = info.get_event()
-        if event.type == Gst.EventType.CAPS:
-            s = event.parse_caps().get_structure(0)
-            ok_w, w = s.get_int('width')
-            ok_h, h = s.get_int('height')
-            if ok_w and ok_h:
-                self.crop_input_size = (w, h)
-                if self.crop_size_filter is not None:
-                    caps = 'video/x-raw,width={},height={}'.format(w, h)
-                    ok_par, par_n, par_d = s.get_fraction('pixel-aspect-ratio')
-                    if ok_par:
-                        caps += ',pixel-aspect-ratio={}/{}'.format(par_n, par_d)
-                    self.crop_size_filter.set_property('caps', Gst.Caps.from_string(caps))
-                self.set_crop(w, h)
-                if any(self.crop_fractions):
-                    GLib.idle_add(self.repaint_still_frame)
-        return Gst.PadProbeReturn.OK
+        if event.type != Gst.EventType.CAPS:
+            return Gst.PadProbeReturn.OK
 
+        s = event.parse_caps().get_structure(0)
+        ok_w, w = s.get_int('width')
+        ok_h, h = s.get_int('height')
+        if not ok_w or not ok_h or w <= 0 or h <= 0:
+            return Gst.PadProbeReturn.OK
+
+        self.crop_input_size = (w, h)
+        if self.crop_size_filter is not None:
+            self.crop_size_filter.set_property(
+                'caps', Gst.Caps.from_string('video/x-raw,width={},height={}'.format(w, h)))
+        self.set_crop(w, h)
+        return Gst.PadProbeReturn.OK
 
     def set_crop(self, w, h):
         """ Set the crop of `videocrop` from :attr:`crop_fractions`, for frames of `w` by `h` pixels.
@@ -340,24 +510,18 @@ class GstOverlay(base.VideoOverlay):
                 self.crop_filter.set_property(name, value)
         return new
 
-
     def apply_crop(self):
         """ Apply :attr:`crop_fractions` to `videocrop` and repaint a paused or frozen frame (main thread).
         """
         if self.crop_filter is None or self.crop_input_size is None:
-            return False  # without a size the caps event will set the crop
+            return False
 
-        # the crop is in pixels of the frame that videocrop receives, which may be scaled already
         w, h = self.crop_input_size
         left, right, top, bottom = self.set_crop(w, h)
         logger.debug('GStreamer: zoom crop left=%d right=%d top=%d bottom=%d on %dx%d', left, right, top, bottom, w, h)
 
         self.repaint_still_frame()
         return False
-
-
-    #: `Gst.Element` the `level` element that reports the audio levels shown by the meter, or `None`
-    audio_level_filter = None
 
     def setup_audio_filter(self):
         """ Add a `level` element to the playbin audio filter, to report the levels for the audio meter.
@@ -366,11 +530,9 @@ class GstOverlay(base.VideoOverlay):
             return
 
         self.audio_level_filter = Gst.ElementFactory.make('level', None)
-        # 50 ms between messages, for a smooth meter
         self.audio_level_filter.set_property('interval', 50 * Gst.MSECOND)
         self.audio_level_filter.set_property('post-messages', True)
         self.playbin.set_property('audio-filter', self.audio_level_filter)
-
 
     def on_element_message(self, bus, msg):
         """ Show the peak level reported by the `level` element on the audio meter.
@@ -385,17 +547,16 @@ class GstOverlay(base.VideoOverlay):
 
         peaks = s.get_value('peak')
         if peaks:
-            # map -60 dBFS .. 0 dBFS to 0 .. 1
             GLib.idle_add(self.update_audio_meter, max(0.0, min(1.0, (max(peaks) + 60.0) / 60.0)))
-
 
     def repaint_still_frame(self):
         """ Seek to the current position to draw the frame again, if the video is paused or frozen at its end.
         """
+        if self.use_d3d12_sink:
+            return
         ret, state, pending = self.playbin.get_state(0)
         is_actively_playing = (state == Gst.State.PLAYING and pending != Gst.State.PAUSED and not self.is_frozen)
         if is_actively_playing or state in {Gst.State.NULL, Gst.State.READY}:
-            # nothing to draw again: playing, or no frame decoded yet
             return
 
         if self.is_frozen:
@@ -404,10 +565,8 @@ class GstOverlay(base.VideoOverlay):
         ok_dur, dur = self.playbin.query_duration(Gst.Format.TIME)
         seek_pos = pos if ok_pos and pos > 0 else int(self.last_timestamp * Gst.SECOND)
         if ok_dur and dur > 0:
-            # a position at the very end has no frame left to decode: stay inside the last frame
             seek_pos = min(seek_pos, max(0, dur - 5 * Gst.MSECOND))
         self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE, seek_pos)
-
 
     def update_gpu_target(self):
         """ Compute the video widget's size in device pixels from the overlay margins (main thread).
@@ -416,16 +575,6 @@ class GstOverlay(base.VideoOverlay):
         """
         if self.gpu_size_filter is None:
             return
-        if self.use_d3d9_sink:
-            # The popup gets frames at the size of the screen it is on, not of the window. The size is fixed when
-            # playback starts, so a video started in a window would otherwise stay at the window's size (blurry) after
-            # going fullscreen. d3dvideosink scales down to a smaller window on the GPU.
-            gdk_window = self.parent.get_window()
-            monitor = self.parent.get_display().get_monitor_at_window(gdk_window) if gdk_window is not None else None
-            if monitor is not None:
-                geometry, scale = monitor.get_geometry(), monitor.get_scale_factor()
-                self.gpu_target = (geometry.width * scale, geometry.height * scale)
-                return
         mo = self.media_overlay
         w = self.parent.get_allocated_width() - mo.props.margin_left - mo.props.margin_right
         h = self.parent.get_allocated_height() - mo.props.margin_top - mo.props.margin_bottom
@@ -433,7 +582,6 @@ class GstOverlay(base.VideoOverlay):
             h -= self.toolbar.get_preferred_height()[1]
         scale = self.parent.get_scale_factor()
         self.gpu_target = (int(w * scale), int(h * scale)) if w >= 16 and h >= 16 else None
-
 
     def on_gpu_convert_event(self, pad, info):
         """ Set the GPU output size when caps reach d3d11convert (streaming thread, no GTK calls).
@@ -472,7 +620,6 @@ class GstOverlay(base.VideoOverlay):
             ))
         return Gst.PadProbeReturn.OK
 
-
     def on_video_widget_allocated(self, widget, allocation):
         """ Handle widget allocation changes for dynamic preview sizing (main thread).
 
@@ -509,7 +656,6 @@ class GstOverlay(base.VideoOverlay):
                 GLib.source_remove(self.preview_resize_timer_id)
             self.preview_resize_timer_id = GLib.timeout_add(250, self.apply_dynamic_preview_size, target_w, target_h)
 
-
     def apply_dynamic_preview_size(self, target_w, target_h):
         """ Update the GPU scaling caps on the fly when the widget grows (main thread).
         """
@@ -533,17 +679,12 @@ class GstOverlay(base.VideoOverlay):
 
         return False
 
-
     def start_frame_tick(self):
         """ Keep GTK's frame clock running while the video plays (main thread, Windows only).
-
-        When the frame clock only wakes up for gtksink's redraw requests, GTK on Windows misses about one refresh in
-        four and drops those frames. A tick callback keeps the clock running on every refresh.
         """
-        if os.name != 'nt' or self.use_d3d9_sink or self.frame_tick_id is not None:
+        if os.name != 'nt' or self.frame_tick_id is not None or self.use_d3d12_sink:
             return
         self.frame_tick_id = self.video_widget.add_tick_callback(self.on_frame_tick)
-
 
     def on_frame_tick(self, widget, frame_clock):
         """ Frame clock tick: stop ticking once the player is no longer playing or about to play.
@@ -557,14 +698,12 @@ class GstOverlay(base.VideoOverlay):
         self.frame_tick_id = None
         return False
 
-
     def stop_frame_tick(self):
         """ Remove the frame clock tick callback, if any (main thread).
         """
         if self.frame_tick_id is not None:
             self.video_widget.remove_tick_callback(self.frame_tick_id)
             self.frame_tick_id = None
-
 
     def popup_geometry(self):
         """ Where the video goes, in screen pixels, from the overlay margins (main thread).
@@ -584,16 +723,13 @@ class GstOverlay(base.VideoOverlay):
             h -= self.toolbar.get_preferred_height()[1]
         if w < 16 or h < 16:
             return None
-        # position in the client area of the toplevel's native window: origin of the parent's GDK window relative to
-        # the toplevel's, plus the parent's position in its GDK window, plus the margins
         x0, y0 = parent_window.get_origin()[1:]
         tx, ty = top_window.get_origin()[1:]
-        if self.parent.get_has_window():
-            px, py = 0, 0
-        else:
-            alloc = self.parent.get_allocation()
-            px, py = alloc.x, alloc.y
-        user32, gdk = win32()
+        px, py = (
+            (0, 0) if self.parent.get_has_window()
+            else (self.parent.get_allocation().x, self.parent.get_allocation().y)
+        )
+        user32, kernel32, gdk = win32()
         owner = gdk.gdk_win32_window_get_handle(hash(top_window))
         scale = self.parent.get_scale_factor()
         point = (ctypes.c_long * 2)((x0 - tx + px + mo.props.margin_left) * scale,
@@ -601,145 +737,15 @@ class GstOverlay(base.VideoOverlay):
         user32.ClientToScreen(owner, point)
         return owner, point[0], point[1], w * scale, h * scale
 
-
-    def on_toplevel_configure(self, widget, event):
-        """ The content window moved or changed size: move the popup with it, once GTK has handled the change.
-
-        Args:
-            widget (:class:`~Gtk.Widget`): the content window
-            event (:class:`~Gdk.EventConfigure`): the configure event
-
-        Returns:
-            `bool`: `False`, to let GTK handle the event as well
-        """
-        if self.popup is not None:
-            GLib.idle_add(lambda: self.place_popup() and False)
-        return False
-
-
-    def place_popup(self):
-        """ Create the (hidden) popup window if needed, or move it over the video area (main thread).
-
-        Returns:
-            `bool`: `True` iff the popup exists and is in place
-        """
-        if not self.use_d3d9_sink or (self.popup is None and not self.is_shown()):
-            return False
-        geometry = self.popup_geometry()
-        if geometry is None:
-            return False
-        owner, x, y, w, h = geometry
-        user32, gdk = win32()
-        if self.popup is not None and (owner != self.popup_owner or not user32.IsWindow(self.popup)):
-            self.destroy_popup()
-        if self.popup is None:
-            # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT, WS_POPUP: no focus, no taskbar
-            # entry, clicks go through, created hidden. Owned by the content window, so it stays above it and is
-            # hidden when it is minimised. Layered, so it can be shown fully transparent while the sink starts.
-            self.popup = user32.CreateWindowExW(0x08000000 | 0x80 | 0x80000 | 0x20, POPUP_CLASS, None, 0x80000000,
-                                                x, y, w, h, owner, None, None, None)
-            user32.SetLayeredWindowAttributes(self.popup, 0, 0, 2)    # LWA_ALPHA, fully transparent
-            self.popup_owner = owner
-        else:
-            user32.SetWindowPos(self.popup, None, x, y, w, h, 0x0004 | 0x0010)   # SWP_NOZORDER | SWP_NOACTIVATE
-        return bool(self.popup)
-
-
-    def hide_popup(self):
-        """ Hide the video popup and cancel a pending reveal (main thread).
-        """
-        self.reveal_gen += 1
-        self.reveal_pending = False
-        if self.popup is not None:
-            user32 = win32()[0]
-            user32.SetLayeredWindowAttributes(self.popup, 0, 0, 2)     # transparent first, then hidden
-            user32.ShowWindow(self.popup, 0)                           # SW_HIDE
-
-
-    def destroy_popup(self):
-        """ Destroy the video popup window (main thread, sink stopped).
-        """
-        if self.popup is not None:
-            win32()[0].DestroyWindow(self.popup)
-            self.popup = None
-            self.popup_owner = None
-            # a new popup can get the same handle value: make sure it is handed over again
-            self.sink_hwnd = None
-
-
-    def dispose(self):
-        """ Release the player and its popup window (called when the overlays are purged or Pympress exits).
-        """
-        if self.use_d3d9_sink:
-            self.hide_popup()
-            self.playbin.set_state(Gst.State.NULL)
-            self.destroy_popup()
-
-
-    def on_d3d9_buffer(self, pad, info):
-        """ First frame reached d3dvideosink: show its popup a little later (streaming thread, no GTK calls).
-        """
-        if self.reveal_pending:
-            self.reveal_pending = False
-            GLib.timeout_add(D3D9_REVEAL_DELAY_MS, self.reveal_popup, self.reveal_gen)
-        return Gst.PadProbeReturn.OK
-
-
-    def reveal_popup(self, gen):
-        """ Make the popup opaque once the sink has drawn a frame into it (main thread).
-
-        Until then the slide, whose first frame should match the video, stays visible: d3dvideosink fills its window
-        with grey before the first frame. The popup is already shown, fully transparent, so the frames are in it
-        (Direct3D does not draw into a hidden window) and nothing has to paint at the reveal.
-
-        Args:
-            gen (`int`): the value of :attr:`reveal_gen` when the reveal was scheduled
-
-        Returns:
-            `bool`: `False` (:func:`~GLib.timeout_add` convention)
-        """
-        if gen == self.reveal_gen and self.popup is not None and self.is_shown():
-            self.reveal_gen += 1
-            self.reveal_pending = False
-            win32()[0].SetLayeredWindowAttributes(self.popup, 0, 255, 2)
-        return False
-
-
-    def prepare_d3d9_play(self):
-        """ Popup in place and shown fully transparent, sink attached, reveal armed (main thread, before PLAYING).
-
-        Returns:
-            `bool`: `True` iff playback can start
-        """
-        if not self.place_popup():
-            logger.error('GStreamer: no popup window for d3dvideosink')
-            return False
-        self.hide_popup()
-        win32()[0].ShowWindow(self.popup, 8)                           # SW_SHOWNA, still fully transparent
-        # Only hand over a new popup: the sink forgets its window when it stops and prepares it again when it starts
-        if self.sink_hwnd != self.popup:
-            self.sink.set_window_handle(self.popup)
-            self.sink_hwnd = self.popup
-        self.reveal_pending = True
-        GLib.timeout_add(D3D9_REVEAL_TIMEOUT_MS, self.reveal_popup, self.reveal_gen)
-        return True
-
-
-    def on_sync_element(self, bus, msg):
-        """ Give d3dvideosink the popup if it asks for a window (streaming thread, no GTK calls).
-        """
-        if self.use_d3d9_sink and self.popup and GstVideo.is_video_overlay_prepare_window_handle_message(msg):
-            msg.src.set_window_handle(self.popup)
-
-
     def is_playing(self):
         """ Returns whether the media is currently playing (and not paused).
 
         Returns:
             `bool`: `True` iff the media is playing.
         """
+        if self.use_d3d12_sink:
+            return D3D12OverlayPlayer.get().is_playing(self)
         return self.playbin.get_state(0).state == Gst.State.PLAYING
-
 
     def _set_file(self, filepath):
         """ Sets the media file to be played by the widget.
@@ -747,9 +753,10 @@ class GstOverlay(base.VideoOverlay):
         Args:
             filepath (`pathlib.Path`): The path to the media file path
         """
-        self.playbin.set_property('uri', filepath.as_uri())
-        self.playbin.set_state(Gst.State.READY)
-
+        self.file = filepath
+        if not self.use_d3d12_sink:
+            self.playbin.set_property('uri', filepath.as_uri())
+            self.playbin.set_state(Gst.State.READY)
 
     def mute(self, value):
         """ Mutes or unmutes the player.
@@ -757,9 +764,9 @@ class GstOverlay(base.VideoOverlay):
         Args:
             value (`bool`): `True` iff this player should be muted
         """
+        if self.use_d3d12_sink:
+            return False
         flags = self.playbin.get_property('flags')
-        # Fall back to the documented value if introspection fails,
-        # see https://gstreamer.freedesktop.org/documentation/playback/playsink.html?gi-language=python#GstPlayFlags
         audio_flag = util.introspect_flag_value(type(flags), 'audio', 0x02)
         if value:
             flags = flags & ~audio_flag
@@ -767,7 +774,6 @@ class GstOverlay(base.VideoOverlay):
             flags = flags | audio_flag
         self.playbin.set_property('flags', flags)
         return False
-
 
     def on_state_changed(self, bus, msg):
         """ Callback triggered by playbin state changes.
@@ -777,34 +783,29 @@ class GstOverlay(base.VideoOverlay):
             msg (:class:`~Gst.Message`): the "state-changed" message
         """
         if msg.src != self.playbin:
-            # ignore the playbin's children
             return
         old, new, pending = msg.parse_state_changed()
         if old == Gst.State.READY and new == Gst.State.PAUSED:
-            # the playbin goes from READY (= stopped) to PLAYING (via PAUSED)
             self.on_initial_play()
-
 
     def on_initial_play(self):
         """ Set starting position, start scrollbar updates, unhide overlay. """
-        # set starting position, if needed
         if self.start_pos:
             self.do_set_time(self.start_pos)
-        # ensure the scroll bar is updated
         GLib.idle_add(self.do_update_duration)
         GLib.timeout_add(self.update_freq, self.do_update_time)
-        # ensure the overlay is visible (if needed)
-        if not self.media_type.startswith('audio') and not self.use_d3d9_sink:
+        if not self.media_type.startswith('audio') and not self.use_d3d12_sink:
             self.video_widget.show()
             self.start_frame_tick()
-
 
     def do_update_duration(self, *args):
         """ Transmit the change of file duration to the UI to adjust the scroll bar.
         """
-        changed, time_ns = self.playbin.query_duration(Gst.Format.TIME)
+        if self.use_d3d12_sink:
+            changed, time_ns = D3D12OverlayPlayer.get().query_duration()
+        else:
+            changed, time_ns = self.playbin.query_duration(Gst.Format.TIME)
         self.update_range(max(0, time_ns) / 1e9)
-
 
     def do_update_time(self):
         """ Update the current position in the progress bar.
@@ -812,14 +813,18 @@ class GstOverlay(base.VideoOverlay):
         Returns:
             `bool`: `True` iff this function should be run again (:func:`~GLib.timeout_add` convention)
         """
-        changed, time_ns = self.playbin.query_position(Gst.Format.TIME)
+        if self.use_d3d12_sink:
+            changed, time_ns = D3D12OverlayPlayer.get().query_position()
+            playing = D3D12OverlayPlayer.get().is_playing(self)
+        else:
+            changed, time_ns = self.playbin.query_position(Gst.Format.TIME)
+            playing = self.playbin.get_state(0).state in {Gst.State.PLAYING, Gst.State.PAUSED}
         time = time_ns / 1e9
         self.update_progress(time)
         if self.last_timestamp <= self.end_pos <= time:
             self.handle_end()
         self.last_timestamp = time
-        return self.playbin.get_state(0).state in {Gst.State.PLAYING, Gst.State.PAUSED}
-
+        return playing
 
     def handle_end(self):
         """ End of the stream reached: mark frozen and stop frame tick.
@@ -829,7 +834,6 @@ class GstOverlay(base.VideoOverlay):
         self.stop_frame_tick()
         super(GstOverlay, self).handle_end()
 
-
     def do_play(self):
         """ Start playing the media file.
 
@@ -838,15 +842,15 @@ class GstOverlay(base.VideoOverlay):
         """
         self.is_frozen = False
         replay = self.restart_if_ended()
+        if self.use_d3d12_sink:
+            if replay:
+                D3D12OverlayPlayer.get().seek(0)
+            return not D3D12OverlayPlayer.get().play(self)
         self.update_gpu_target()
-        if self.use_d3d9_sink and not self.is_playing() and not self.prepare_d3d9_play():
-            return False
         self.playbin.set_state(Gst.State.PLAYING)
         if replay:
             self.start_frame_tick()
-
         return False
-
 
     def do_play_pause(self):
         """ Toggle pause mode of the media.
@@ -858,18 +862,23 @@ class GstOverlay(base.VideoOverlay):
         """
         self.is_frozen = False
         replay = self.restart_if_ended()
-        self.update_gpu_target()
-        if (self.use_d3d9_sink and not self.is_playing() and self.playbin.get_state(0)[1] != Gst.State.PAUSED and
-                not self.prepare_d3d9_play()):
+        if self.use_d3d12_sink:
+            player = D3D12OverlayPlayer.get()
+            if replay:
+                player.seek(0)
+                player.play(self)
+            elif self.is_playing():
+                player.pause()
+            else:
+                player.resume()
             return False
+        self.update_gpu_target()
         new_state = Gst.State.PLAYING if replay or not self.is_playing() else Gst.State.PAUSED
         if new_state == Gst.State.PAUSED:
             GLib.idle_add(self.update_audio_meter, 0.0)
         self.playbin.set_state(new_state)
         self.start_frame_tick()
-
         return False
-
 
     def do_pause(self):
         """ Pauses the media, keeping its current frame on screen.
@@ -877,13 +886,15 @@ class GstOverlay(base.VideoOverlay):
         Returns:
             `bool`: `True` iff this function should be run again (:func:`~GLib.idle_add` convention)
         """
+        if self.use_d3d12_sink:
+            if self.is_playing() and not self.ended:
+                D3D12OverlayPlayer.get().pause()
+            return False
         ret, state, pending = self.playbin.get_state(0)
         if (state == Gst.State.PLAYING or pending == Gst.State.PLAYING) and not self.ended:
             GLib.idle_add(self.update_audio_meter, 0.0)
             self.playbin.set_state(Gst.State.PAUSED)
-
         return False
-
 
     def do_stop(self):
         """ Stops playing in the backend player.
@@ -893,16 +904,14 @@ class GstOverlay(base.VideoOverlay):
             GLib.source_remove(self.preview_resize_timer_id)
             self.preview_resize_timer_id = None
         self.is_frozen = False
+        if self.use_d3d12_sink:
+            D3D12OverlayPlayer.get().stop()
+            return False
         self.stop_frame_tick()
-        # hide the popup before stopping, so the slide shows instead of the sink's last frame
-        if self.use_d3d9_sink:
-            self.hide_popup()
         self.playbin.set_state(Gst.State.NULL)
         self.playbin.set_state(Gst.State.READY)
         self.video_widget.hide()
-
         return False
-
 
     def do_set_time(self, time):
         """ Set the player at time `~time`.
@@ -917,9 +926,11 @@ class GstOverlay(base.VideoOverlay):
         """
         self.last_timestamp = time
         self.ended = False
-        self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, time * Gst.SECOND)
+        if self.use_d3d12_sink:
+            D3D12OverlayPlayer.get().seek(time)
+        else:
+            self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, time * Gst.SECOND)
         return False
-
 
     @classmethod
     def setup_backend(cls, gst_opts = []):
@@ -928,11 +939,24 @@ class GstOverlay(base.VideoOverlay):
         Returns:
             `str`: the version of Gst used by the backend
         """
+        if getattr(sys, 'frozen', False):
+            # Frozen packages bring their own plugins, and must not pick up another install's
+            plugins = pathlib.Path(sys.executable).parent.joinpath('lib', 'gstreamer-1.0')
+            os.environ['GST_PLUGIN_PATH'] = str(plugins)
+            os.environ['GST_PLUGIN_SYSTEM_PATH'] = ''
+
+            cache_dir = pathlib.Path(GLib.get_user_cache_dir(), 'pympress')
+            cache_dir.mkdir(parents = True, exist_ok = True)
+            os.environ['GST_REGISTRY'] = str(cache_dir.joinpath('gstreamer-registry.bin'))
+
         Gst.init(gst_opts)
 
         if Gst.ElementFactory.make('gtksink', None) is None:
             logger.warning('Can not create a gtksink. Check the gtk plugin for GStreamer is installed.')
             logger.warning('See https://github.com/Cimbali/pympress/issues/240')
             raise ValueError('Can not create a gtksink.')
+
+        if os.name == 'nt' and Gst.ElementFactory.find('d3d12videosink') is not None:
+            logger.info('GStreamer backend: Direct3D 12 video sink (d3d12videosink) available')
 
         return Gst.version_string()
