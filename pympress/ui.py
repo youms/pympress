@@ -1384,6 +1384,17 @@ class UI(builder.Builder):
         self.medias.set_pass_through(pass_through)
 
 
+    def update_media_zoom_selection(self, zoom_points, scale, shift):
+        """ Callback to draw or clear the zoom selection over native media overlays.
+
+        Args:
+            zoom_points (`list` of `tuple`): [(x0, y0), (x1, y1)] in normalized slide space, or `None`
+            scale (`float`): the current zoom factor
+            shift (`tuple` of `float`): the current (shift_x, shift_y)
+        """
+        self.medias.update_zoom_selection(zoom_points, scale, shift)
+
+
     def redraw_current_slide(self):
         """ Callback to queue a redraw of the current slides (in both winows).
         """

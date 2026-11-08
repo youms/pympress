@@ -433,6 +433,12 @@ class VideoOverlay(builder.Builder):
             window.set_pass_through(self.pass_through)
 
 
+    def update_zoom_selection(self, zoom_points, scale, shift):
+        """ Backend hook to render zoom selection over native video popups. Subclasses override.
+        """
+        pass
+
+
     def set_zoom(self, scale, shift):
         """ Apply zoom transformation to this overlay.
 

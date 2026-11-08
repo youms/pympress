@@ -273,6 +273,15 @@ class Media(object):
                 overlay.set_zoom(scale, shift)
 
 
+    def update_zoom_selection(self, zoom_points, scale, shift):
+        """ Update the zoom selection rectangle on active media overlays that use native windows.
+        """
+        for overlays in self._media_overlays.values():
+            for overlay in overlays:
+                if overlay.is_shown():
+                    overlay.update_zoom_selection(zoom_points, scale, shift)
+
+
     def set_pass_through(self, pass_through):
         """ Let pointer events go through all media overlays to the slide below them, or catch them again.
 
@@ -590,6 +599,7 @@ class Zoom(object):
         self.clear_cache = builder.get_callback_handler('clear_zoom_cache')
         self.set_media_zoom = builder.get_callback_handler('set_media_zoom')
         self.set_media_pass_through = builder.get_callback_handler('set_media_pass_through')
+        self.update_media_zoom_selection = builder.get_callback_handler('update_media_zoom_selection')
         self.set_action_enabled = builder.get_callback_handler('app.set_action_enabled')
 
         builder.setup_actions({
@@ -659,6 +669,9 @@ class Zoom(object):
         """
         self.redraw_current_slide()
         self.selection_da.queue_draw()
+        if self.update_media_zoom_selection:
+            pts = self.zoom_points if self.zoom_selecting else None
+            self.update_media_zoom_selection(pts, self.scale, self.shift)
 
 
     def apply_zoom_to_medias(self):
@@ -681,6 +694,7 @@ class Zoom(object):
         self.set_selection_on_top(False)
         self.set_media_pass_through(False)
         self.zoom_points = None
+        self.redraw_zoom()
         return True
 
 
