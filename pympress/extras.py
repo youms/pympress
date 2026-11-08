@@ -579,6 +579,10 @@ class Zoom(object):
     p_overlay = None
     #: :class:`~Gtk.DrawingArea` above the media overlays, to draw the zoom selection over a video
     selection_da = None
+    #: :class:`~Gtk.Overlay` in the Content window containing the current slide and the media overlays
+    c_overlay = None
+    #: :class:`~Gtk.DrawingArea` above the Content media overlays, to draw the zoom selection over a video
+    c_selection_da = None
     #: callback, to be connected to :meth:`~pympress.app.Pympress.set_action_enabled`
     set_action_enabled = None
 
@@ -616,6 +620,15 @@ class Zoom(object):
         self.p_overlay.set_overlay_pass_through(self.selection_da, True)
         self.selection_da.show()
 
+        if self.c_overlay is not None:
+            self.c_selection_da = Gtk.DrawingArea()
+            self.c_selection_da.set_name('zoom-selection-content')
+            self.c_selection_da.connect('draw', self.draw_selection_overlay)
+            self.c_selection_da.connect('realize', lambda widget: widget.get_window().set_pass_through(True))
+            self.c_overlay.add_overlay(self.c_selection_da)
+            self.c_overlay.set_overlay_pass_through(self.c_selection_da, True)
+            self.c_selection_da.show()
+
 
     def start_zooming(self, *args):
         """ Setup for the user to select the zooming area.
@@ -640,6 +653,8 @@ class Zoom(object):
             on_top (`bool`): whether the selection goes above the media overlays
         """
         self.p_overlay.reorder_overlay(self.selection_da, -1 if on_top else 0)
+        if self.c_selection_da is not None and self.c_overlay is not None:
+            self.c_overlay.reorder_overlay(self.c_selection_da, -1 if on_top else 0)
 
 
     def stop_zooming(self, *args):
@@ -669,6 +684,8 @@ class Zoom(object):
         """
         self.redraw_current_slide()
         self.selection_da.queue_draw()
+        if self.c_selection_da is not None:
+            self.c_selection_da.queue_draw()
         if self.update_media_zoom_selection:
             pts = self.zoom_points if self.zoom_selecting else None
             self.update_media_zoom_selection(pts, self.scale, self.shift)

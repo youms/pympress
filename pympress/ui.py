@@ -1348,7 +1348,6 @@ class UI(builder.Builder):
             cairo_context.transform(zoom_matrix)
 
             self.scribbler.draw_scribble(widget, cairo_context)
-            self.zoom.draw_zoom_target(widget, cairo_context)
 
             cairo_context.restore()
 
