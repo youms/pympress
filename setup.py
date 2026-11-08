@@ -191,7 +191,7 @@ def gstreamer_plugins():
     if os.name != 'nt':
         return []
 
-    plugins = 'app audioconvert audioparsers audioresample autodetect coreelements d3d d3d11 directsound gtk \
+    plugins = 'app audioconvert audioparsers audioresample autodetect coreelements d3d d3d11 d3d12 directsound gtk \
     isomp4 level libav matroska playback typefindfunctions videocrop videofilter videoconvertscale \
     videoparsersbad volume wasapi2'.split()
 
