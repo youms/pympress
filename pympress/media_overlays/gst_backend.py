@@ -43,7 +43,7 @@ from pympress.media_overlays import base
 
 
 #: Delay (ms) between the first frame reaching d3d12videosink and showing its window
-D3D12_REVEAL_DELAY_MS = 30
+D3D12_REVEAL_DELAY_MS = 60
 #: Show the video window after this delay (ms) even if no frame arrived
 D3D12_REVEAL_TIMEOUT_MS = 1500
 #: Window class of the persistent Direct3D 12 popups
