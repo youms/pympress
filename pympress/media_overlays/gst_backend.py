@@ -275,6 +275,7 @@ class D3D12OverlayPlayer(object):
         is_actively_playing = (state == Gst.State.PLAYING and pending != Gst.State.PAUSED)
         if is_actively_playing or state in {Gst.State.NULL, Gst.State.READY}:
             return
+        self.playbin.set_state(Gst.State.PAUSED)
         ok_pos, pos = self.playbin.query_position(Gst.Format.TIME)
         ok_dur, dur = self.playbin.query_duration(Gst.Format.TIME)
         seek_pos = pos if ok_pos and pos > 0 else 0
