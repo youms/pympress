@@ -352,7 +352,7 @@ class D3D12OverlayPlayer(object):
         if self.popup:
             self.user32.SetLayeredWindowAttributes(self.popup, 0, 0, 2)
             self.user32.ShowWindow(self.popup, 0)  # SW_HIDE = 0
-        self.playbin.set_state(Gst.State.PAUSED)
+        self.playbin.set_state(Gst.State.READY)
 
     def seek(self, time_sec):
         """ Seek the persistent pipeline to time `time_sec` in seconds. """
