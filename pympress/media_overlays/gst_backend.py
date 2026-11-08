@@ -286,14 +286,30 @@ class D3D12OverlayPlayer(object):
             GLib.idle_add(self.active_overlay.do_update_duration)
 
     def on_sink_buffer(self, pad, info):
-        """ First frame reached d3d12videosink: show popup a little later (streaming thread, no GTK calls). """
+        """ First frame reached d3d12videosink: ensure check_rendered is polling (streaming thread, no GTK calls). """
         if self.reveal_pending:
-            self.reveal_pending = False
-            GLib.timeout_add(D3D12_REVEAL_DELAY_MS, self.reveal_popup, self.reveal_gen)
+            GLib.idle_add(self.check_rendered, self.reveal_gen)
         return Gst.PadProbeReturn.OK
 
+    def check_rendered(self, gen):
+        """ Poll d3d12videosink rendered count and unmask popup only after frame 0 is presented (main thread). """
+        if gen != self.reveal_gen or self.popup is None or not self.user32.IsWindow(self.popup):
+            return False
+        if not self.reveal_pending:
+            return False
+
+        st = self.sink.get_property('stats')
+        ok, rendered = st.get_uint64('rendered') if st else (False, 0)
+        if ok and rendered >= 1:
+            self.reveal_gen += 1
+            self.reveal_pending = False
+            self.user32.SetLayeredWindowAttributes(self.popup, 0, 255, 2)
+            return False
+
+        return True
+
     def reveal_popup(self, gen):
-        """ Make the popup opaque once the sink has drawn a frame into it (main thread). """
+        """ Fallback: make popup opaque if rendered check timed out (main thread). """
         if gen == self.reveal_gen and self.popup is not None and self.user32.IsWindow(self.popup):
             self.reveal_gen += 1
             self.reveal_pending = False
@@ -507,10 +523,11 @@ class D3D12OverlayPlayer(object):
         self.playbin.set_state(Gst.State.READY)
         self.playbin.set_property('uri', uri)
 
-        # Show native HWND transparently first (SW_SHOWNA = 8), reveal when first buffer arrives
+        # Show native HWND transparently first (SW_SHOWNA = 8), reveal only when frame 0 is rendered
         self.user32.SetLayeredWindowAttributes(self.popup, 0, 0, 2)
         self.user32.ShowWindow(self.popup, 8)
         self.reveal_pending = True
+        GLib.timeout_add(10, self.check_rendered, self.reveal_gen)
         GLib.timeout_add(D3D12_REVEAL_TIMEOUT_MS, self.reveal_popup, self.reveal_gen)
         self.playbin.set_state(Gst.State.PLAYING)
         return True
