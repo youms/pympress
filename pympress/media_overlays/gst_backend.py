@@ -42,6 +42,10 @@ from pympress import util
 from pympress.media_overlays import base
 
 
+#: Delay (ms) between the first frame reaching d3d12videosink and showing its window
+D3D12_REVEAL_DELAY_MS = 30
+#: Show the video window after this delay (ms) even if no frame arrived
+D3D12_REVEAL_TIMEOUT_MS = 1500
 #: Window class of the persistent Direct3D 12 popups
 D3D12_POPUP_CLASS = 'PympressD3D12Popup'
 
@@ -73,6 +77,7 @@ def win32():
         ctypes.c_int, ctypes.c_int, ctypes.c_uint
     ]
     user32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    user32.SetLayeredWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_ubyte, ctypes.c_uint]
     user32.RegisterClassExW.argtypes = [ctypes.c_void_p]
     user32.RegisterClassExW.restype = ctypes.c_ushort
     user32.DefWindowProcW.restype = ctypes.c_longlong
@@ -145,6 +150,22 @@ class D3D12OverlayPlayer(object):
         self.playbin.set_property('video-sink', self.sink)
         self.playbin.set_property('audio-sink', Gst.ElementFactory.make('fakesink', 'd3d12_fake_audio'))
 
+        # Reveal and flash avoidance
+        self.reveal_pending = False
+        self.reveal_gen = 0
+        sink_pad = self.sink.get_static_pad('sink')
+        if sink_pad is not None:
+            sink_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_sink_buffer)
+
+        # Video crop filter for zoom (d3d12videosink scales on GPU, no CPU videoscale needed)
+        self.crop_filter = Gst.ElementFactory.make('videocrop', 'd3d12_zoomcrop')
+        if self.crop_filter is not None:
+            self.playbin.set_property('video-filter', self.crop_filter)
+            self.crop_filter.get_static_pad('sink').add_probe(
+                Gst.PadProbeType.EVENT_DOWNSTREAM, self.on_crop_sink_event
+            )
+        self.crop_input_size = None
+
         self.popup = None
         self.popup_owner = None
         self.active_overlay = None
@@ -198,6 +219,69 @@ class D3D12OverlayPlayer(object):
         if self.active_overlay:
             GLib.idle_add(self.active_overlay.do_update_duration)
 
+    def on_sink_buffer(self, pad, info):
+        """ First frame reached d3d12videosink: show popup a little later (streaming thread, no GTK calls). """
+        if self.reveal_pending:
+            self.reveal_pending = False
+            GLib.timeout_add(D3D12_REVEAL_DELAY_MS, self.reveal_popup, self.reveal_gen)
+        return Gst.PadProbeReturn.OK
+
+    def reveal_popup(self, gen):
+        """ Make the popup opaque once the sink has drawn a frame into it (main thread). """
+        if gen == self.reveal_gen and self.popup is not None and self.user32.IsWindow(self.popup):
+            self.reveal_gen += 1
+            self.reveal_pending = False
+            self.user32.SetLayeredWindowAttributes(self.popup, 0, 255, 2)
+        return False
+
+    def on_crop_sink_event(self, pad, info):
+        """ Follow the size of frames reaching videocrop (streaming thread). """
+        event = info.get_event()
+        if event.type != Gst.EventType.CAPS:
+            return Gst.PadProbeReturn.OK
+        s = event.parse_caps().get_structure(0)
+        ok_w, w = s.get_int('width')
+        ok_h, h = s.get_int('height')
+        if ok_w and ok_h and w > 0 and h > 0:
+            self.crop_input_size = (w, h)
+            if self.active_overlay and any(self.active_overlay.crop_fractions):
+                GLib.idle_add(self.apply_crop, self.active_overlay)
+        return Gst.PadProbeReturn.OK
+
+    def set_crop(self, w, h, crop_fractions):
+        """ Set the crop of videocrop from crop_fractions, for frames of w x h. """
+        new = [round(f * size) for f, size in zip(crop_fractions, (w, w, h, h))]
+        new[1] = max(0, min(new[1], w - new[0] - 2))
+        new[3] = max(0, min(new[3], h - new[2] - 2))
+        names = ('left', 'right', 'top', 'bottom')
+        old = [self.crop_filter.get_property(name) for name in names]
+        for values in ([min(o, n) for o, n in zip(old, new)], new):
+            for name, value in zip(names, values):
+                self.crop_filter.set_property(name, value)
+        return new
+
+    def apply_crop(self, overlay):
+        """ Apply crop_fractions from overlay to videocrop (main thread). """
+        if self.crop_filter is None or self.crop_input_size is None or self.active_overlay != overlay:
+            return False
+        w, h = self.crop_input_size
+        self.set_crop(w, h, overlay.crop_fractions)
+        self.repaint_still_frame()
+        return False
+
+    def repaint_still_frame(self):
+        """ Seek to current position to draw frame again when paused or frozen. """
+        ret, state, pending = self.playbin.get_state(0)
+        is_actively_playing = (state == Gst.State.PLAYING and pending != Gst.State.PAUSED)
+        if is_actively_playing or state in {Gst.State.NULL, Gst.State.READY}:
+            return
+        ok_pos, pos = self.playbin.query_position(Gst.Format.TIME)
+        ok_dur, dur = self.playbin.query_duration(Gst.Format.TIME)
+        seek_pos = pos if ok_pos and pos > 0 else 0
+        if ok_dur and dur > 0:
+            seek_pos = min(seek_pos, max(0, dur - 5 * Gst.MSECOND))
+        self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE, seek_pos)
+
     def ensure_popup(self, owner, x, y, w, h):
         """ Ensure the persistent popup HWND exists, is owned by toplevel, and matches geometry. """
         if self.popup is not None and (owner != self.popup_owner or not self.user32.IsWindow(self.popup)):
@@ -207,14 +291,16 @@ class D3D12OverlayPlayer(object):
 
         if self.popup is None:
             # WS_EX_NOACTIVATE (0x08000000) | WS_EX_TOOLWINDOW (0x80) | WS_EX_TRANSPARENT (0x20)
+            # | WS_EX_LAYERED (0x00080000)
             # WS_POPUP (0x80000000)
-            ex_style = 0x08000000 | 0x80 | 0x20
+            ex_style = 0x08000000 | 0x80 | 0x20 | 0x00080000
             style = 0x80000000
             self.popup = self.user32.CreateWindowExW(
                 ex_style, D3D12_POPUP_CLASS, None, style,
                 x, y, w, h, owner, None, None, None
             )
             self.popup_owner = owner
+            self.user32.SetLayeredWindowAttributes(self.popup, 0, 0, 2)  # fully transparent initially
             self.sink.set_window_handle(self.popup)
         else:
             # SWP_NOZORDER (0x0004) | SWP_NOACTIVATE (0x0010)
@@ -240,8 +326,11 @@ class D3D12OverlayPlayer(object):
         self.playbin.set_state(Gst.State.READY)
         self.playbin.set_property('uri', uri)
 
-        # Show native HWND (SW_SHOWNA = 8)
+        # Show native HWND transparently first (SW_SHOWNA = 8), reveal when first buffer arrives
+        self.user32.SetLayeredWindowAttributes(self.popup, 0, 0, 2)
         self.user32.ShowWindow(self.popup, 8)
+        self.reveal_pending = True
+        GLib.timeout_add(D3D12_REVEAL_TIMEOUT_MS, self.reveal_popup, self.reveal_gen)
         self.playbin.set_state(Gst.State.PLAYING)
         return True
 
@@ -257,7 +346,10 @@ class D3D12OverlayPlayer(object):
 
     def stop(self):
         """ Hide the popup window and pause the persistent pipeline. """
+        self.reveal_gen += 1
+        self.reveal_pending = False
         if self.popup:
+            self.user32.SetLayeredWindowAttributes(self.popup, 0, 0, 2)
             self.user32.ShowWindow(self.popup, 0)  # SW_HIDE = 0
         self.playbin.set_state(Gst.State.PAUSED)
 
@@ -378,8 +470,9 @@ class GstOverlay(base.VideoOverlay):
         self.video_widget.hide()
 
         if self.use_d3d12_sink:
-            # Reposition persistent D3D12 popup when parent changes allocation or moves
+            # Reposition persistent D3D12 popup when parent or overlay changes allocation or moves
             self.parent.connect('size-allocate', lambda *args: D3D12OverlayPlayer.get().update_geometry(self))
+            self.media_overlay.connect('size-allocate', lambda *args: D3D12OverlayPlayer.get().update_geometry(self))
             toplevel = self.parent.get_toplevel()
             if toplevel is not None and toplevel.is_toplevel():
                 toplevel.connect(
@@ -441,8 +534,11 @@ class GstOverlay(base.VideoOverlay):
             return
 
         crop = Gst.ElementFactory.make('videocrop', 'zoomcrop')
-        size = Gst.ElementFactory.make('capsfilter', 'zoomsize')
-        elements = [crop, Gst.ElementFactory.make('videoscale', 'zoomscale'), size]
+        elements = [crop]
+        size = None
+        if not self.use_d3d12_sink:
+            size = Gst.ElementFactory.make('capsfilter', 'zoomsize')
+            elements += [Gst.ElementFactory.make('videoscale', 'zoomscale'), size]
         video_filter = self.playbin.get_property('video-filter')
 
         if video_filter is None:
@@ -513,6 +609,10 @@ class GstOverlay(base.VideoOverlay):
     def apply_crop(self):
         """ Apply :attr:`crop_fractions` to `videocrop` and repaint a paused or frozen frame (main thread).
         """
+        if self.use_d3d12_sink:
+            D3D12OverlayPlayer.get().update_geometry(self)
+            return D3D12OverlayPlayer.get().apply_crop(self)
+
         if self.crop_filter is None or self.crop_input_size is None:
             return False
 
