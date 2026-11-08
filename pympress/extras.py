@@ -575,6 +575,10 @@ class Zoom(object):
 
     #: :class:`~Gtk.Box` in the Presenter window, used to reliably set cursors.
     p_central = None
+    #: :class:`~Gtk.DrawingArea` Slide in the Presenter window, used to reliably set cursors.
+    p_da_cur = None
+    #: :class:`~Gtk.DrawingArea` Slide in the Contents window, used to reliably set cursors.
+    c_da = None
     #: :class:`~Gtk.Overlay` in the Presenter window containing the current slide and the media overlays
     p_overlay = None
     #: :class:`~Gtk.DrawingArea` above the media overlays, to draw the zoom selection over a video
@@ -630,6 +634,13 @@ class Zoom(object):
             self.c_selection_da.show()
 
 
+    def set_zoom_cursor(self, cursor_name='parent'):
+        """ Set or reset the cursor for all zoom-interactive slide and overlay widgets. """
+        for w in (self.p_central, self.p_da_cur, self.c_da, self.selection_da, self.c_selection_da):
+            if w is not None:
+                Cursor.set_cursor(w, cursor_name)
+
+
     def start_zooming(self, *args):
         """ Setup for the user to select the zooming area.
 
@@ -638,7 +649,7 @@ class Zoom(object):
         """
         self.zoom_selecting = True
         self.set_media_pass_through(True)
-        Cursor.set_cursor(self.p_central, 'crosshair')
+        self.set_zoom_cursor('crosshair')
         self.set_selection_on_top(True)
 
         return True
@@ -663,7 +674,7 @@ class Zoom(object):
         Returns:
             `bool`: whether the event was consumed
         """
-        Cursor.set_cursor(self.p_central)
+        self.set_zoom_cursor('parent')
         self.zoom_selecting = False
         self.set_selection_on_top(False)
         self.set_media_pass_through(False)
@@ -706,7 +717,7 @@ class Zoom(object):
         if not self.zoom_selecting:
             return False
 
-        Cursor.set_cursor(self.p_central)
+        self.set_zoom_cursor('parent')
         self.zoom_selecting = False
         self.set_selection_on_top(False)
         self.set_media_pass_through(False)
@@ -810,7 +821,7 @@ class Zoom(object):
                 self.shift = (0, 0)
 
             # stop drawing rectangles and reset cursor (NB don't use window, this bugs)
-            Cursor.set_cursor(self.p_central)
+            self.set_zoom_cursor('parent')
 
             self.zoom_selecting = False
             self.set_selection_on_top(False)

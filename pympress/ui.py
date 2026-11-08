@@ -1581,7 +1581,7 @@ class UI(builder.Builder):
 
         if self.zoom.zoom_selecting:
             # keep the crosshair of the zoom selection, also over a link: the area of a video is one
-            extras.Cursor.set_cursor(widget, 'parent')
+            extras.Cursor.set_cursor(widget, 'crosshair')
             return True
 
         # Where did the event occur?
