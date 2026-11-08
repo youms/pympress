@@ -262,6 +262,8 @@ class D3D12OverlayPlayer(object):
 
     def apply_crop(self, overlay):
         """ Apply crop_fractions from overlay to videocrop (main thread). """
+        if self.active_overlay is None:
+            self.active_overlay = overlay
         if self.crop_filter is None or self.crop_input_size is None or self.active_overlay != overlay:
             return False
         w, h = self.crop_input_size
@@ -272,13 +274,16 @@ class D3D12OverlayPlayer(object):
     def repaint_still_frame(self):
         """ Seek to current position to draw frame again when paused or frozen. """
         ret, state, pending = self.playbin.get_state(0)
-        is_actively_playing = (state == Gst.State.PLAYING and pending != Gst.State.PAUSED)
+        is_frozen = bool(self.active_overlay and self.active_overlay.is_frozen)
+        is_actively_playing = (state == Gst.State.PLAYING and pending != Gst.State.PAUSED and not is_frozen)
         if is_actively_playing or state in {Gst.State.NULL, Gst.State.READY}:
             return
-        self.playbin.set_state(Gst.State.PAUSED)
+        if is_frozen:
+            self.playbin.set_state(Gst.State.PAUSED)
         ok_pos, pos = self.playbin.query_position(Gst.Format.TIME)
         ok_dur, dur = self.playbin.query_duration(Gst.Format.TIME)
-        seek_pos = pos if ok_pos and pos > 0 else 0
+        last_ts = getattr(self.active_overlay, 'last_timestamp', 0) if self.active_overlay else 0
+        seek_pos = pos if ok_pos and pos > 0 else int(last_ts * Gst.SECOND)
         if ok_dur and dur > 0:
             seek_pos = min(seek_pos, max(0, dur - 5 * Gst.MSECOND))
         self.playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE, seek_pos)
@@ -611,7 +616,6 @@ class GstOverlay(base.VideoOverlay):
         """ Apply :attr:`crop_fractions` to `videocrop` and repaint a paused or frozen frame (main thread).
         """
         if self.use_d3d12_sink:
-            D3D12OverlayPlayer.get().update_geometry(self)
             return D3D12OverlayPlayer.get().apply_crop(self)
 
         if self.crop_filter is None or self.crop_input_size is None:
