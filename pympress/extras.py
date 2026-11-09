@@ -640,7 +640,8 @@ class Zoom(object):
 
     def set_zoom_cursor(self, cursor_name='parent'):
         """ Set or reset the cursor for all zoom-interactive slide and overlay widgets. """
-        for w in (self.p_win, self.c_win, self.p_central, self.p_da_cur, self.c_da, self.selection_da, self.c_selection_da):
+        for w in (self.p_win, self.c_win, self.p_central, self.p_da_cur, self.c_da,
+                  self.selection_da, self.c_selection_da):
             if w is not None:
                 Cursor.set_cursor(w, cursor_name)
 
